@@ -1,6 +1,6 @@
 // FanuXpert service worker — network-first for the app doc so updates show,
 // cache-first for static libraries; offline falls back to cache.
-const CACHE = "fanuxpert-v2";
+const CACHE = "fanuxpert-v3";
 const ASSETS = [
   "/", "/index.html", "/manifest.json",
   "/icon-192.png", "/icon-512.png", "/apple-touch-icon.png",
