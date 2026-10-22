@@ -1,8 +1,8 @@
 <!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>FanuXpert</title>
+<title>Fanuc Diagnostic Guide</title>
 <style>html,body{margin:0;background:#0D0F12}#boot{color:#7A8896;font:14px -apple-system,system-ui,sans-serif;padding:24px}</style>
-<div id="root"><div id="boot">Loading FanuXpert… (compiling, first load takes a few seconds)</div></div>
+<div id="root"><div id="boot">Loading Fanuc Diagnostic Guide… (compiling, first load takes a few seconds)</div></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js"></script>
@@ -7048,36 +7048,38 @@ function BrowsePage({ onAlarm, cat = null, onCat, onBack }) {
 }
 
 // ── HISTORY PAGE ─────────────────────────────────────────────────
-function HistoryPage({ history, onAlarm }) {
-  if (history.length===0) return (
+function FavoritesPage({ favorites, onAlarm, onRemove }) {
+  if (favorites.length===0) return (
     <div style={{padding:"24px 0",textAlign:"center",paddingTop:48}}>
-      <div style={{fontSize:44,marginBottom:16}}>📋</div>
-      <div style={{fontSize:16,fontWeight:700,color:C.text,marginBottom:8}}>No history yet</div>
-      <div style={{fontSize:13,color:C.textSub,lineHeight:1.6,maxWidth:260,margin:"0 auto"}}>
-        Alarm guides you open will appear here for quick access next time.
+      <div style={{fontSize:44,marginBottom:16}}>⭐</div>
+      <div style={{fontSize:16,fontWeight:700,color:C.text,marginBottom:8}}>No favorites yet</div>
+      <div style={{fontSize:13,color:C.textSub,lineHeight:1.6,maxWidth:280,margin:"0 auto"}}>
+        Open any alarm and tap the ☆ star in the top bar to save it here for quick access.
       </div>
     </div>
   );
 
   return (
     <div style={{padding:"24px 0"}}>
-      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:6}}>Recent</div>
-      <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:-0.5,marginBottom:16}}>Alarm History</div>
+      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:6}}>Saved</div>
+      <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:-0.5,marginBottom:16}}>Favorites</div>
       <div style={{display:"flex",flexDirection:"column",gap:8}}>
-        {history.map((a,i)=>(
-          <button key={i} onClick={()=>onAlarm(a.key)}
+        {favorites.map((a,i)=>(
+          <div key={i}
             style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,
-              padding:"12px 14px",display:"flex",alignItems:"center",gap:12,
-              cursor:"pointer",textAlign:"left",width:"100%"}}>
-            <div style={{flex:1}}>
+              padding:"12px 14px",display:"flex",alignItems:"center",gap:12,width:"100%"}}>
+            <button onClick={()=>onRemove(a.key)} title="Remove from favorites"
+              style={{background:"transparent",border:"none",color:C.fanuc,fontSize:20,
+                cursor:"pointer",flexShrink:0,lineHeight:1}}>★</button>
+            <button onClick={()=>onAlarm(a.key)}
+              style={{flex:1,background:"transparent",border:"none",cursor:"pointer",textAlign:"left",padding:0}}>
               <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:5}}>
-                {a.codes.filter(c=>/^\d/.test(c)).slice(0,4).map(c=><Badge key={c} label={c} />)}
+                {(a.codes||[]).filter(c=>/^\d/.test(c)).slice(0,4).map(c=><Badge key={c} label={c} />)}
               </div>
-              <div style={{fontSize:14,fontWeight:600,color:C.text,marginBottom:2}}>{a.title}</div>
-              <div style={{fontSize:12,color:C.textSub}}>{a.desc}</div>
-            </div>
+              <div style={{fontSize:14,fontWeight:600,color:C.text}}>{a.title}</div>
+            </button>
             <span style={{color:C.textDim,fontSize:18,flexShrink:0}}>›</span>
-          </button>
+          </div>
         ))}
       </div>
     </div>
@@ -7178,17 +7180,25 @@ function GuidesPage({ onScenario }) {
 }
 
 // ── HOME PAGE ────────────────────────────────────────────────────
-function HomePage({ onPhoto, onManual, onAlarm, history }) {
+// FANUC-style brand mark — recreated in the brand yellow (not the official logo asset).
+const FanucMark = ({ size = 34 }) => (
+  <div style={{width:size,height:size,borderRadius:Math.round(size*0.24),background:C.fanuc,
+    display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,
+    boxShadow:`0 0 10px ${C.fanuc}55`}}>
+    <span style={{fontSize:Math.round(size*0.52),fontWeight:900,color:"#0D0F12",
+      letterSpacing:-1,fontFamily:"'Inter',sans-serif",lineHeight:1}}>F</span>
+  </div>
+);
+
+function HomePage({ onPhoto, onManual, onAlarm, favorites }) {
   return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <div style={{background:`linear-gradient(160deg,#1a1600 0%,${C.bg} 60%)`,
         borderBottom:`1px solid ${C.border}`,padding:"28px 20px 24px"}}>
         <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
-          <div style={{width:38,height:38,borderRadius:10,background:C.fanuc,display:"flex",alignItems:"center",justifyContent:"center"}}>
-            <span style={{fontSize:18}}>⚙</span>
-          </div>
+          <FanucMark size={38} />
           <div>
-            <div style={{fontSize:13,fontWeight:700,letterSpacing:1,color:C.fanuc}}>FanuXpert</div>
+            <div style={{fontSize:14,fontWeight:800,letterSpacing:0.3,color:C.fanuc}}>Fanuc diagnostic guide</div>
           </div>
         </div>
         <div style={{fontSize:26,fontWeight:800,color:C.text,letterSpacing:-0.8,lineHeight:1.2,marginBottom:8}}>Alarm on the machine?</div>
@@ -7217,8 +7227,7 @@ function HomePage({ onPhoto, onManual, onAlarm, history }) {
               { icon:"📊", label:"STATUS Display",  sub:"LED state reference",       key:"status" },
               { icon:"🔢", label:"DGN 358 Decoder", sub:"SV0401 diagnostic tool",    key:"dgn" },
               { icon:"🔴", label:"7-Seg Lookup",    sub:"PSM / SVM / SPM codes",     key:"amp" },
-              { icon:"📋", label:"Alarm History",   sub:"Recently opened guides",     key:"history" },
-              { icon:"📚", label:"All Alarms",      sub:"Search & browse database",  key:"browse" },
+              { icon:"⭐", label:"Favorites",       sub:"Your saved alarms",         key:"favorites" },
             ].map(item=>(
               <button key={item.key} onClick={()=>onAlarm(item.key)}
                 style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,
@@ -7232,20 +7241,21 @@ function HomePage({ onPhoto, onManual, onAlarm, history }) {
         </div>
 
         <div style={{marginTop:4}}>
-          <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:10}}>Recently Viewed</div>
-          {history.length===0 ? (
+          <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:10}}>Favorites</div>
+          {favorites.length===0 ? (
             <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,
               padding:"16px 14px",textAlign:"center",fontSize:13,color:C.textDim}}>
-              No history yet — open an alarm guide to start
+              No favorites yet — tap ☆ on any alarm to save it here
             </div>
-          ) : history.slice(0,3).map((a,i)=>(
+          ) : favorites.slice(0,3).map((a,i)=>(
             <button key={i} onClick={()=>onAlarm(a.key)}
               style={{width:"100%",background:C.card,border:`1px solid ${C.border}`,borderRadius:10,
                 padding:"11px 14px",display:"flex",alignItems:"center",gap:12,
                 cursor:"pointer",marginBottom:6,textAlign:"left"}}>
+              <span style={{color:C.fanuc,fontSize:16,flexShrink:0}}>★</span>
               <div style={{flex:1}}>
                 <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:5}}>
-                  {a.codes.filter(c=>/^\d/.test(c)).slice(0,4).map(c=><Badge key={c} label={c} />)}
+                  {(a.codes||[]).filter(c=>/^\d/.test(c)).slice(0,4).map(c=><Badge key={c} label={c} />)}
                 </div>
                 <div style={{fontSize:13,fontWeight:500,color:C.text}}>{a.title}</div>
               </div>
@@ -7492,7 +7502,18 @@ function App() {
   const [screen,    setScreen]    = useState("home");
   const [alarm,     setAlarm]     = useState(null);
   const [scenario,  setScenario]  = useState(null);
-  const [history,   setHistory]   = useState([]);
+  const [favorites, setFavorites] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("fx_favorites") || "[]"); } catch { return []; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("fx_favorites", JSON.stringify(favorites)); } catch {}
+  }, [favorites]);
+  const isFavorite = (key) => favorites.some(f => f.key === key);
+  const toggleFavorite = (fav) =>
+    setFavorites(list => list.some(f => f.key === fav.key)
+      ? list.filter(f => f.key !== fav.key)
+      : [{ key: fav.key, title: fav.title, codes: fav.codes || [] }, ...list]);
+  const removeFavorite = (key) => setFavorites(list => list.filter(f => f.key !== key));
 
   // ── Navigation back-stack ───────────────────────────────────────
   // Every forward move pushes the CURRENT full view onto the stack.
@@ -7543,17 +7564,33 @@ function App() {
   };
 
   const goAlarm = (key) => {
-    if (key==="history") return go({ screen:"history" });
+    if (key==="favorites") return go({ screen:"favorites" });
     if (key==="browse")  return go({ screen:"browse"  });
     if (key==="guides")  return go({ screen:"guides"  });
     if (key==="amp")     return go({ screen:"amp"     });
     if (["status","dgn"].includes(key)) return go({ screen:"alarm", alarm:key });
-    const entry = ALARM_DB.find(a=>a.key===key);
-    if (entry) setHistory(h=>[entry,...h.filter(i=>i.key!==key)].slice(0,10));
     go({ screen:"alarm", alarm:key });
   };
 
   const goScenario = (key) => go({ screen:"scenario", scenario:key });
+
+  // Favorite target for the alarm currently open (null for tools / unknowns).
+  const currentFav = (() => {
+    if (screen !== "alarm" || !alarm || alarm==="status" || alarm==="dgn") return null;
+    if (typeof alarm === "string" && alarm.startsWith("amp:")) {
+      const [, unit, ledCode] = alarm.split(":");
+      const dbMap = { PSM: PSM_ALARM_DB, SVM: SVM_ALARM_DB, SPM: SPM_ALARM_DB };
+      const e = (dbMap[unit]||[]).find(x => x.code === ledCode);
+      return e ? { key: alarm, title: `${unit} ${e.code} — ${e.title}`, codes: [] } : null;
+    }
+    if (typeof alarm === "string" && alarm.startsWith("err:")) {
+      const [, , errCode] = alarm.split(":");
+      const e = SPM_ERROR_DB.find(x => x.code === errCode);
+      return e ? { key: alarm, title: `SPM ERR ${e.code} — ${e.title}`, codes: [] } : null;
+    }
+    const e = findAlarmByKey(alarm);
+    return e ? { key: alarm, title: e.title, codes: e.codes || [] } : null;
+  })();
 
   // Phone hardware Back button → act like the in-app back arrow.
   // We keep one "armed" history entry; each hardware Back pops our own nav
@@ -7571,9 +7608,9 @@ function App() {
   }, []);
 
   const titles = {
-    home:"FanuXpert", photo:"Photo Mode", manual:"Manual Entry",
+    home:"Fanuc diagnostic guide", photo:"Photo Mode", manual:"Manual Entry",
     status:"STATUS Reference", dgn:"DGN 358 Decoder",
-    browse:"All Alarms", history:"Alarm History",
+    browse:"All Alarms", favorites:"Favorites",
     guides:"Troubleshooting", scenario:"Guide",
     amp:"7-Seg Alarm Lookup",
     alarm:"Alarm Guide",
@@ -7647,23 +7684,34 @@ function App() {
         {/* Nav bar */}
         <div style={{display:"flex",alignItems:"center",gap:10,padding:"14px 16px 12px",
           borderBottom:`1px solid ${C.border}`,background:C.surface,flexShrink:0}}>
-          {screen!=="home" && (
+          {screen!=="home" ? (
             <button onClick={goBack}
               style={{width:32,height:32,borderRadius:8,background:C.card,
                 border:`1px solid ${C.border}`,color:C.text,fontSize:16,cursor:"pointer",flexShrink:0}}>
               ‹
             </button>
+          ) : (
+            <FanucMark size={28} />
           )}
-          <div style={{flex:1,fontSize:16,fontWeight:700,color:C.text}}>{titles[screen]||"FanuXpert"}</div>
+          <div style={{flex:1,fontSize:16,fontWeight:700,color:C.text}}>{titles[screen]||"Fanuc diagnostic guide"}</div>
+          {currentFav && (
+            <button onClick={()=>toggleFavorite(currentFav)}
+              title={isFavorite(currentFav.key) ? "Remove from favorites" : "Add to favorites"}
+              style={{width:32,height:32,borderRadius:8,background:C.card,
+                border:`1px solid ${C.border}`,color:C.fanuc,fontSize:18,cursor:"pointer",
+                flexShrink:0,lineHeight:1}}>
+              {isFavorite(currentFav.key) ? "★" : "☆"}
+            </button>
+          )}
         </div>
 
         {/* Content */}
         <div style={{flex:1,overflowY:"auto",padding:screen==="home"?0:"0 16px 24px"}}>
-          {screen==="home"     && <HomePage onPhoto={()=>nav("photo")} onManual={()=>nav("manual")} onAlarm={goAlarm} history={history} />}
+          {screen==="home"     && <HomePage onPhoto={()=>nav("photo")} onManual={()=>nav("manual")} onAlarm={goAlarm} favorites={favorites} />}
           {screen==="photo"    && <PhotoPage onResult={goAlarm} />}
           {screen==="manual"   && <ManualEntryPage onResult={goAlarm} />}
           {screen==="browse"   && <BrowsePage onAlarm={goAlarm} cat={browseCat} onCat={(c)=>go({screen:"browse",browseCat:c})} onBack={goBack} />}
-          {screen==="history"  && <HistoryPage history={history} onAlarm={goAlarm} />}
+          {screen==="favorites" && <FavoritesPage favorites={favorites} onAlarm={goAlarm} onRemove={removeFavorite} />}
           {screen==="guides"   && <GuidesPage onScenario={goScenario} />}
           {screen==="amp"      && <AmpAlarmPage onNav={goAlarm} />}
           {screen==="scenario" && <div style={{paddingTop:20}}>{scenarioContent()}</div>}
