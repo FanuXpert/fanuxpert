@@ -6687,7 +6687,7 @@ If no alarm codes visible: {"codes":[]}` }
           onClick={() => fileRef.current?.click()}>
           <div style={{fontSize:44,marginBottom:12}}>📷</div>
           <div style={{fontSize:15,fontWeight:700,color:C.fanuc,marginBottom:4}}>Take a Photo</div>
-          <div style={{fontSize:12,color:C.textSub}}>Point camera at the CNC alarm screen</div>
+          <div style={{fontSize:12,color:C.textSub}}>Tap to open the camera</div>
         </div>
         {/* Camera: capture forces the rear camera */}
         <input ref={fileRef} type="file" accept="image/*" capture="environment"
@@ -6697,11 +6697,6 @@ If no alarm codes visible: {"codes":[]}` }
         <input ref={galRef} type="file" accept="image/*"
           onChange={e=>{ const f=e.target.files?.[0]; if(f) processImage(f); }}
           style={{display:"none"}} />
-        <button onClick={()=>fileRef.current?.click()}
-          style={{width:"100%",background:C.fanuc,border:"none",borderRadius:10,
-            padding:"14px",fontSize:15,fontWeight:700,color:C.bg,cursor:"pointer",marginBottom:10}}>
-          📷 Open Camera
-        </button>
         <button onClick={()=>galRef.current?.click()}
           style={{width:"100%",background:C.card,border:`1.5px solid ${C.fanuc}`,borderRadius:10,
             padding:"14px",fontSize:15,fontWeight:700,color:C.fanuc,cursor:"pointer",marginBottom:12}}>
