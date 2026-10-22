@@ -1,5 +1,6 @@
-// FanuXpert offline service worker
-const CACHE = "fanuxpert-v1";
+// FanuXpert service worker — network-first for the app doc so updates show,
+// cache-first for static libraries; offline falls back to cache.
+const CACHE = "fanuxpert-v2";
 const ASSETS = [
   "/", "/index.html", "/manifest.json",
   "/icon-192.png", "/icon-512.png", "/apple-touch-icon.png",
@@ -18,13 +19,27 @@ self.addEventListener("activate", (e) => {
 self.addEventListener("fetch", (e) => {
   const req = e.request;
   if (req.method !== "GET") return;
-  e.respondWith(
-    caches.match(req).then((hit) =>
-      hit || fetch(req).then((res) => {
+  const url = new URL(req.url);
+  const isAppDoc = req.mode === "navigate" ||
+    (url.origin === self.location.origin &&
+      (url.pathname === "/" || url.pathname.endsWith("/index.html") || url.pathname.endsWith("/manifest.json")));
+  if (isAppDoc) {
+    // network-first: always try fresh, fall back to cache when offline
+    e.respondWith(
+      fetch(req).then((res) => {
         const copy = res.clone();
         caches.open(CACHE).then((c) => { try { c.put(req, copy); } catch (x) {} });
         return res;
-      }).catch(() => (req.mode === "navigate" ? caches.match("/index.html") : undefined))
-    )
+      }).catch(() => caches.match(req).then((h) => h || caches.match("/index.html")))
+    );
+    return;
+  }
+  // cache-first for static libs / icons
+  e.respondWith(
+    caches.match(req).then((hit) => hit || fetch(req).then((res) => {
+      const copy = res.clone();
+      caches.open(CACHE).then((c) => { try { c.put(req, copy); } catch (x) {} });
+      return res;
+    }).catch(() => undefined))
   );
 });
