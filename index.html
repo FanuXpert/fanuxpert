@@ -8,7 +8,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="FanuXpert">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-<style>html,body{margin:0;background:#0D0F12}#boot{color:#7A8896;font:14px -apple-system,system-ui,sans-serif;padding:24px}</style>
+<style>html,body{margin:0;background:#0D0F12;height:100%;overflow:hidden;overscroll-behavior:none}#boot{color:#7A8896;font:14px -apple-system,system-ui,sans-serif;padding:24px}</style>
 <div id="root"><div id="boot">Loading FanuXpert… (compiling, first load takes a few seconds)</div></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
@@ -7699,7 +7699,7 @@ function App() {
         ::-webkit-scrollbar-thumb { background:${C.border}; border-radius:2px; }
         @keyframes blink { 50%{opacity:0} }
       `}</style>
-      <div style={{maxWidth:430,margin:"0 auto",height:"100vh",display:"flex",
+      <div style={{maxWidth:430,margin:"0 auto",height:"100dvh",display:"flex",
         flexDirection:"column",background:C.bg,boxShadow:"0 0 60px #00000088"}}>
 
         {/* Nav bar */}

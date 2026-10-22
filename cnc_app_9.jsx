@@ -7683,7 +7683,7 @@ export default function App() {
         ::-webkit-scrollbar-thumb { background:${C.border}; border-radius:2px; }
         @keyframes blink { 50%{opacity:0} }
       `}</style>
-      <div style={{maxWidth:430,margin:"0 auto",height:"100vh",display:"flex",
+      <div style={{maxWidth:430,margin:"0 auto",height:"100dvh",display:"flex",
         flexDirection:"column",background:C.bg,boxShadow:"0 0 60px #00000088"}}>
 
         {/* Nav bar */}
