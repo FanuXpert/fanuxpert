@@ -1,0 +1,7684 @@
+import { useState, useRef, useEffect, memo } from "react";
+
+// ── colour tokens ────────────────────────────────────────────────
+const C = {
+  bg:        "#0D0F12",
+  surface:   "#161A1F",
+  card:      "#1C2128",
+  border:    "#252C35",
+  fanuc:     "#FFD000",
+  fanucDim:  "#3A3000",
+  red:       "#E03E3E",
+  redDim:    "#2D1212",
+  green:     "#2ECC71",
+  greenDim:  "#0D2E1A",
+  orange:    "#F0A500",
+  orangeDim: "#2E2000",
+  blue:      "#4A8FE7",
+  blueDim:   "#0D1E35",
+  text:      "#E8EDF2",
+  textSub:   "#7A8896",
+  textDim:   "#3D4D5C",
+};
+
+// ── alarm database ───────────────────────────────────────────────
+// Ordered per B-65285EN §2.4 + PS/OT from B-64115EN
+const ALARM_DB = [
+  // ── PS ALARMS ─────────────────────────────────────────────────────────────
+  {
+    key: "esp",
+    codes: ["EMG","ESP","emergency","estop"],
+    title: "Emergency Stop",
+    desc: "EMG blinking on the CNC screen — the emergency-stop chain is open (button, overtravel, or an MTB interlock). Often no alarm number is shown.",
+    type: "PS", severity: "med",
+  },
+
+  // ── OT ALARMS ─────────────────────────────────────────────────────────────
+  {
+    key: "ot500",
+    codes: ["500","501","OT0500","OT0501"],
+    title: "Hardware Overtravel",
+    desc: "Hardware OT limit switch activated — axis at mechanical travel limit",
+    type: "OT", severity: "med",
+  },
+
+  // ── ENCODER / DETECTOR ALARMS — COMBINED (SV0361-0369 built-in, SV0380-0387 separate) ──
+  { key:"sv_encoder",
+    codes:["361","362","363","364","365","366","367","368","369",
+           "380","381","382","383","384","385","386","387",
+           "SV0361","SV0362","SV0363","SV0364","SV0365","SV0366","SV0367","SV0368","SV0369",
+           "SV0380","SV0381","SV0382","SV0383","SV0384","SV0385","SV0386","SV0387"],
+    title:"Pulsecoder / Detector Alarm",
+    desc:"Feedback alarm from built-in pulsecoder (361-369) or separate detector (380-387) — cable, encoder/scale, or battery",
+    type:"SV", severity:"high",
+    summary:"Feedback device alarm. Cause is almost always the feedback cable or the encoder/detector itself. Battery bits matter only on absolute encoders.",
+    custom:"encoder" },
+
+
+  // ── SV ALARMS (per B-65285EN §2.4 order) ──────────────────────────────────
+  { key:"sv401", codes:["401","SV0401"], title:"V Ready Off",
+    desc:"Servo ready (VRDY) didn't come on, or dropped during operation — check for a preceding alarm first, then read DGN 358 to see which ready step failed",
+    type:"SV", severity:"high",
+    summary:"The servo amplifier's ready signal (VRDY) never turned on, or turned off during operation. Very often it's secondary to another servo/amp alarm — clear that first. DGN 358 pinpoints exactly which step of the ready handshake failed; then work the power magnetic circuit around the amplifier.",
+    context:"B-64115EN §8.14: MCON (CNC→amp, 'turn MCC on / activate') and VRDY (amp→CNC, 'I'm ready') are exchanged over the FSSB. 401 fires if VRDY doesn't come on, or drops mid-operation. The manual's first note matters: this alarm is often raised because ANOTHER alarm fired — take action on that first alarm before chasing 401. DGN 358 (V ready-off info) is the fast way in — it shows how far the ready sequence got.",
+    steps:[
+      { title:"Is there another alarm? Clear it first",
+        detail:"The manual is explicit: 401 is frequently secondary to another servo/PSM/SPM alarm. Check the full alarm list and the amplifier 7-seg displays. If a PSM ('−' / a code) or SVM/SPM alarm is present, work THAT first — 401 often clears with it." },
+      { title:"Read DGN 358 to see which ready step failed",
+        detail:"SYSTEM → DGN → 358 (V ready-off info). Convert to binary; the ready steps set in sequence, and the first bit that is NOT 1 (from bit 5 upward) is where it stalled: bit6 = *ESP, bits7–9 = MCON, bit10 = CRDY (PS ready), bit11 = RLY (DB relay), bit12 = INTL (interlock), bit13 = DRDY (drive ready). Common values: 417 = still in E-stop; 993 = PS CRDY not output; 4065 = interlock not input; 97 = axis-detach set. (Same decode as the VRDY-OFF troubleshooting guide.)" },
+      { title:"Check the power magnetic circuit — the §8.14 list",
+        detail:"Work the manual's checklist: PSM control power on? Emergency stop fully released? Terminating connector fitted on JX1B of the last (terminating) amplifier? MCC actually on — and if there's an external MCC sequence besides the PSM's MCC contact, check that too? Is the MCC-drive power supplied? Is the breaker on?" },
+      { title:"Check the PSM/SPM for their own alarms",
+        detail:"Read the PSM and SPM 7-seg displays directly. An alarm there (converter or spindle) stops the whole rack reaching ready and surfaces as 401 on the axis. Resolve the amplifier-side alarm." },
+      { title:"Replace the servo amplifier",
+        detail:"§8.14: if the power magnetic circuit around the amplifier is all good and no upstream alarm explains it, the servo amplifier is the likely fault — replace the SVM for the alarming axis." },
+      { title:"Replace the axis control card",
+        detail:"§8.14 second action: if replacing the amplifier doesn't clear 401, replace the axis control card on the CNC (the FSSB master that exchanges MCON/VRDY). See §2.4 for its location." },
+    ],
+    source:"B-64115EN §8.14" },
+  { key:"sv402", codes:["402","SV0402"], title:"SV Card Not Exist",
+    desc:"Axis control card is not installed in the CNC",
+    type:"SV", severity:"high",
+    summary:"CNC cannot detect the servo axis control card (FSSB master board).",
+    context:"This alarm fires at power-on when the CNC expects an axis control card but cannot find one. Usually occurs after a board swap, CNC main board replacement, or incorrect system configuration.",
+    steps:[
+      { title:"Check the axis control card is seated",
+        detail:"Open the CNC unit and verify the servo axis control card is properly seated in its slot. On 0i series, this is the FSSB optical board. A card that has worked itself loose (vibration, a previous service) reads as not present." },
+      { title:"Re-seat the axis control card",
+        detail:"Power off completely. Remove and re-insert the card firmly into its slot. Ensure the connector pins align correctly and the retention screws are tight." },
+      { title:"Verify system configuration matches hardware",
+        detail:"After a main board or system replacement, the system configuration (option data) must match the installed hardware. If the CNC expects more axes than the installed card supports, this alarm will fire." },
+      { title:"Replace the axis control card",
+        detail:"If the card is installed but the alarm persists, the card may be faulty. Replace with the correct FANUC part number for this CNC model." },
+    ],
+    source:"B-64115EN §5.4" },
+  { key:"sv403", codes:["403","SV0403"], title:"Card / Software Mismatch",
+    desc:"Axis control card and servo software combination is illegal",
+    type:"SV", severity:"high",
+    summary:"Illegal combination of axis control card and servo software. The manual names two causes: the correct axis control card is not fitted, OR the correct servo software is not installed on flash (FROM).",
+    context:"Shows at power-on and almost always follows a service action. B-64115EN gives two causes: (a) a correct axis control card is not provided, or (b) correct servo software is not installed on flash memory. In the field, (b) — a bad or incomplete FROM software write — is the more common and the cheaper to fix, so reload the software before chasing card part numbers.",
+    steps:[
+      { title:"Confirm what changed just before the alarm",
+        detail:"This alarm follows a service action almost every time. Establish exactly what was done — a software update/write, a main board swap, or an axis-control-card replacement. That points you at cause (a) card or (b) software." },
+      { title:"Reload the servo software into flash (FROM)",
+        detail:"Cause (b): correct servo software not installed on flash memory. Using the boot system, re-write the servo/CNC software component from a known-good backup. A corrupted or partially-written FROM is the cheapest thing to rule out — do it before touching hardware." },
+      { title:"Verify the axis control card is the correct type",
+        detail:"Cause (a): check the axis control card part number against what this software edition requires (SYSTEM → CONFIG for the software series/edition). A card that doesn't match the software raises this alarm." },
+      { title:"Check the card is fully seated",
+        detail:"A card that has worked loose can read as the wrong/absent card. Power off, reseat the axis control card firmly, retighten its screws, power on." },
+      { title:"Make software and card match",
+        detail:"Bring the two into a valid combination: reload the correct servo software for the fitted card, or fit the correct card for the installed software. Consult FANUC if you can't confirm a valid pairing." },
+      { title:"Replace the FROM/SRAM module or the card",
+        detail:"If a clean software reload and a confirmed-correct, well-seated card still throw 403, the FROM/SRAM module (where the software lives) or the axis control card is faulty. Back up SRAM first, then replace. See §2.4 for card locations." },
+    ],
+    source:"B-64115EN §5.4" },
+  { key:"sv404", codes:["404","SV0404"], title:"V Ready ON (unexpected)",
+    desc:"DRDY came on even though MCON was off — check SVM-to-CNC interface",
+    type:"SV", severity:"high",
+    summary:"Drive ready (DRDY/VRDY) is ON when it should be OFF — either VRDY stayed on after the CNC dropped MCON, or DRDY came on at power-up before MCON. Manual fix: replace the servo amplifier, then the axis control card.",
+    context:"The amplifier reports ready when the CNC did not command it — VRDY still on when MCON went off, or DRDY on before MCON at power-up. B-64115EN §8.15 treats this as a hardware fault and gives a definite fix order: replace the servo amplifier first, and if that doesn't clear it, replace the axis control card. It is NOT documented as a communication glitch — a power-cycle is only a quick sanity check.",
+    steps:[
+      { title:"Note the axis number from the message",
+        detail:"The alarm names the axis (e.g. '1-TH AXIS'). That identifies which SVM is asserting ready when it should not be." },
+      { title:"Power-cycle once as a sanity check",
+        detail:"Turn all power off, wait 30 seconds, power on. This only rules out a one-time power-up race (DRDY seen before MCON). If it returns, treat it as the hardware fault the manual describes — do not keep chasing it as a glitch." },
+      { title:"Check the servo amp is properly connected",
+        detail:"Appendix A note: confirm the servo interface and the amplifier are connected — FSSB optical link seated at both ends, and the SVM control PCB (faceplate) pushed fully home. A poor connection can make the ready line misbehave." },
+      { title:"Replace the servo amplifier for that axis",
+        detail:"§8.15 first action: the amplifier is asserting ready when it should not. Replace the SVM driving the alarming axis." },
+      { title:"Replace the axis control card",
+        detail:"§8.15 second action: if replacing the amplifier does not solve it, replace the axis control card on the CNC. See §2.4 for card locations." },
+    ],
+    source:"B-64115EN §5.4" },
+  { key:"sv405", codes:["405","SV0405"], title:"Zero Point Return Fault",
+    desc:"NC or servo fault during reference position return — retry manual ref return",
+    type:"SV", severity:"high",
+    summary:"Position-control fault during reference return — an NC or servo fault meant the return could not complete. Manual's own instruction: try again from the manual reference position return.",
+    context:"B-64115EN gives no long procedure for 405 — the alarm-list text says a position-control fault (NC or servo side) prevented the reference return from completing, and to retry from manual reference return. The most common field trigger is a disturbed absolute encoder (battery replaced, feedback cable pulled) that left the reference un-established (APZ=0). The dog, one-rotation signal and parameters are the usual physical suspects after that.",
+    steps:[
+      { title:"Retry from manual reference return",
+        detail:"The manual's direct instruction. Select REF mode, jog toward the reference point. Note whether it fails at the same place each time — a repeatable failure points at the dog/one-rotation signal; a random one points at feedback noise." },
+      { title:"Was a battery or feedback cable just disturbed? Check APZ",
+        detail:"On an absolute pulsecoder, a dead/replaced battery or a disturbed feedback cable leaves the reference un-established. Check P1815#4 (APZ): 0 = reference NOT established. If 0, re-establish the reference position — this is the single most common cause after service." },
+      { title:"Check the deceleration dog and decel limit switch",
+        detail:"The dog must trip the decel switch at the right spot before the grid point. A bent, broken, or misaligned dog, or a failed switch, makes the return sequence fail. Confirm the switch actually operates." },
+      { title:"Check the dog-to-grid distance — DGN 302",
+        detail:"On 0i-C, DGN 302 shows the distance from the end of the deceleration dog to the first grid point. It should sit around half a grid; if it's very small the return can jump by one grid intermittently — the classic ref-return fault. If it's marginal, adjust the dog position or the grid shift (P1850). For the one-rotation (Z) signal itself, DGN 305 shows the position feedback between Z phases — a missing/erratic Z points at the pulsecoder or feedback cable." },
+      { title:"Verify reference-return parameters",
+        detail:"Check P1240 (coordinate of the reference position), P1850 (grid shift amount), and P1006 (reference-return direction bit). Wrong values after a parameter restore or battery event will fail the return." },
+      { title:"Restore verified parameters and re-reference",
+        detail:"If a parameter restore or battery event preceded the alarm, reload a known-good servo parameter set for this machine, then re-establish the reference position." },
+    ],
+    source:"B-64115EN §5.4" },
+  { key:"sv407", codes:["407","SV0407"], title:"Excess Error (Synchronous Control)",
+    desc:"Position difference between synchronized axes exceeded param 8314",
+    type:"SV", severity:"high",
+    summary:"In simple synchronous control, the difference in machine coordinates between the two synchronized axes exceeded parameter 8314. One axis is lagging the other.",
+    context:"B-64115EN: this fires in SIMPLE SYNCHRONOUS CONTROL (two axes commanded as one — gantry/dual-drive) when the machine-coordinate difference between the synchronized pair exceeds parameter 8314. Its companion in the same function is SV0420, which watches the TORQUE-command difference (param 2031) instead of the position difference — 407 = position, 420 = torque. Causes here: one axis dragging mechanically, mismatched servo gains, or a drifting encoder on one side.",
+    steps:[
+      { title:"Confirm which difference tripped — position vs torque",
+        detail:"407 is the position/coordinate-difference alarm in simple synchronous control (param 8314). Its sibling SV0420 watches the torque-command difference (param 2031) in the same function. If 420 is the one showing, work that card instead — the cause set is different (torque imbalance, not position lag)." },
+      { title:"Check one axis for a mechanical problem",
+        detail:"Jog/inspect each axis of the pair individually. If one is stiffer, noisier, or drags (lubrication, ballscrew, guide), it lags the other and opens the coordinate difference." },
+      { title:"Compare position gain and servo params master vs slave",
+        detail:"Both axes in the pair must have matching servo tuning. Compare position gain P1825 first (the usual culprit), then the velocity-loop and time-constant parameters. Any mismatch makes one axis respond differently and drift from its partner." },
+      { title:"Check following error per axis — DGN 300",
+        detail:"Read the position error (following error) for each axis on DGN 300 — the manual defines DGN 300 as position error in detection units. Comparing the two axes shows which one is lagging and by how much." },
+      { title:"Temporarily widen the tolerance to confirm",
+        detail:"SYSTEM → PARAM → 8314 → NO.SRH. Note the current value, raise it temporarily. If the alarm clears, the deviation is real but bounded — find and fix the root cause.",
+        warn:"Restore the original value after testing. Running with excessive tolerance hides a real synchronization fault." },
+      { title:"Check for a drifting encoder on one axis",
+        detail:"If one encoder reports intermittently, its position drifts from the partner axis and trips 407. Watch DGN 300 per axis during a slow move — the axis whose error wanders is the suspect feedback." },
+    ],
+    source:"B-64115EN §5.4" },
+  { key:"sv409", codes:["409","SV0409"], title:"Torque Alarm",
+    desc:"Abnormal servo motor load detected — or spindle in Cs mode",
+    type:"SV", severity:"high",
+    summary:"Abnormal servo motor load detected — or, in Cs mode, abnormal spindle motor load. Physical overload/collision, mechanical bind, or a wrong abnormal-load detection setting.",
+    context:"B-64115EN: abnormal servo motor load detected; alternatively, abnormal spindle motor load detected in Cs mode. This is the unexpected-disturbance-torque (abnormal-load) detection function firing. First triage is WHEN it fired — mid-cut/rapid points at a real overload or collision; light-load or standstill points at the detection level being set too tight. The manual gives no parameter numbers for 409; the detection-level parameters live in the servo parameter manual B-65270EN for this control/motor.",
+    steps:[
+      { title:"When did it fire — under load, or light/standstill?",
+        detail:"Mid-program, in a cut or rapid → suspect a genuine overload or collision (next steps). At light load or standstill → suspect the abnormal-load detection setting (step 4). This split saves the most time." },
+      { title:"Check for collision or obstruction",
+        detail:"Was a program running? Look for tool/workpiece collision, fixture interference, or an axis driven into a hard stop. Inspect for visible damage." },
+      { title:"Turn the axis by hand (power off)",
+        detail:"Power off. Rotate the motor coupling or ballscrew by hand. Locked or very stiff = mechanical bind — lubrication, ballscrew nut, linear guide, or a brake not releasing." },
+      { title:"Check the abnormal-load detection level",
+        detail:"If it trips at light load or standstill, the unexpected-disturbance-torque detection level is likely set too tight. The exact detection-level parameter for this control/motor is in the servo parameter manual B-65270EN — verify it against the machine-builder value rather than guessing. (The old note here pointed at 2015/2016; those are servo function-bit registers, not the abnormal-load detection level — ignore them for this alarm.)" },
+      { title:"Cs mode — check spindle orientation load",
+        detail:"If it fires during spindle orientation / Cs (M19), the spindle is meeting too much resistance at the orient position. Check the orientation mechanism, dog, and sensor." },
+      { title:"Confirm against builder spec before changing detection",
+        detail:"Abnormal-load detection exists to protect the machine. Confirm any level change against the machine-builder specification rather than raising it to silence the alarm." },
+    ],
+    source:"B-64115EN §5.4" },
+  {
+    key: "sv410",
+    codes: ["410","411","SV0410","SV0411"],
+    title: "Servo Excess Error",
+    desc: "Position error too large — at stop (410) or during movement (411)",
+    type: "SV", severity: "high",
+  },
+  { key:"sv413", codes:["413","SV0413"], title:"LSI Overflow",
+    desc:"Error register for n-th axis exceeded limit — check CMR parameter",
+    type:"SV", severity:"high",
+    summary:"The axis error register overflowed (exceeded ±2³¹). The manual attributes this to improperly set parameters — most often the scaling ones (CMR / flexible feed gear).",
+    context:"B-64115EN: the contents of the error register for the axis exceeded ±2³¹, usually the result of improperly set parameters. The error register accumulates command-minus-feedback; a wrong scaling parameter makes it run away instantly. The usual suspects are CMR (command multiplier) and the flexible feed gear (2084/2085), which together set command-to-detection-unit scaling. It almost always appears right after a parameter change or restore.",
+    steps:[
+      { title:"Check what changed just before it appeared",
+        detail:"413 almost always follows a parameter edit, a restore from the wrong backup, or a motor/detection change. Establish what was touched — that usually names the bad parameter." },
+      { title:"Check the CMR (command multiplier)",
+        detail:"Verify CMR matches the machine's detection unit and feedback resolution (from ballscrew pitch, gear ratio, encoder resolution). A wrong CMR scales the command wrongly and overflows the error register fast." },
+      { title:"Check the flexible feed gear (2084/2085)",
+        detail:"P2084/2085 set the flexible feed gear (command-to-detection scaling). Wrong values here overflow the register the same way a bad CMR does. Verify both against the machine spec." },
+      { title:"Watch the error register — DGN 300",
+        detail:"DGN 300 shows the position error in detection units. If it explodes the instant the axis is enabled or on the smallest move, the scaling is wrong (parameters), not a mechanical or feedback fault." },
+      { title:"Restore verified parameters or recompute the scaling",
+        detail:"If a known-good backup exists, restore the full servo parameter set and power-cycle. If not, recompute CMR and 2084/2085 from the machine specification and set them correctly." },
+    ],
+    source:"B-64115EN §5.4" },
+  { key:"sv415", codes:["415","SV0415"], title:"Excess Shift",
+    desc:"Speed above 524288000 units/s attempted — check CMR setting",
+    type:"SV", severity:"high",
+    summary:"A speed above 524288000 units/s was attempted on the axis. The manual attributes this specifically to an improperly set CMR.",
+    context:"B-64115EN: a speed higher than 524288000 units/s was attempted on the axis — the result of an improperly set CMR. A wrong CMR scales the commanded speed so far up that it passes the internal limit. It is a parameter fault, not hardware; a genuinely too-high programmed feedrate on top of a marginal scaling can also push it over.",
+    steps:[
+      { title:"Check what changed just before it appeared",
+        detail:"Like 413, this follows a parameter edit or restore almost every time. Establish what was touched — CMR/scaling is the prime suspect." },
+      { title:"Check the CMR",
+        detail:"The manual's named cause. Verify CMR matches the machine's detection unit and feedback resolution. An incorrect CMR scales every speed command wrongly and trips 415." },
+      { title:"Check the flexible feed gear (2084/2085)",
+        detail:"These scale command-to-detection alongside CMR. A wrong ratio here also inflates the internal speed value. Verify against the machine spec." },
+      { title:"Check the programmed feedrate on the failing block",
+        detail:"If 415 fires only on one program block, read its F-word. A genuinely excessive feedrate, combined with the machine's gearing, can overflow the speed register even with correct scaling." },
+      { title:"Restore verified parameters or recompute CMR",
+        detail:"Restore a known-good servo parameter set and power-cycle, or recompute CMR and 2084/2085 from the machine specification and set them correctly." },
+    ],
+    source:"B-64115EN §5.4" },
+  {
+    key: "sv417",
+    codes: ["027","417","SV0027","SV0417"],
+    title: "Digital Servo Parameter Error",
+    desc: "Illegal value in a digital servo parameter — the servo cannot initialise. SV0027 on 15i, SV0417 on all other series.",
+    type: "SV", severity: "high",
+    summary:"A digital servo parameter holds an illegal value, so the servo can't initialise. The CNC points at the exact parameter via DGN 352 / DGN 280. Fix the flagged value, then re-do the servo initial setting.",
+    context:"B-64115EN lists the conditions: motor form 2020 out of range; motor direction 2022 not 111 or -111; velocity-pulse 2023 ≤ 0; position-pulse 2024 ≤ 0; flexible feed gear 2084/2085 not set; servo axis number 1023 out of range or non-consecutive; or, on PMC-axis torque control, the torque-constant parameter left at 0. It almost always follows a motor swap, a parameter restore, or a first start-up. Same alarm on all controls — SV0027 on 15i, SV0417 on 16i/18i/20i/21i/0i and Power Mate i.",
+    steps:[
+      { title:"Read the CNC's own pointer — DGN 352 or DGN 280",
+        detail:"Let the control tell you which parameter. If DGN 203#4 (PRM) = 1, DGN 352 gives a detail number identifying the exact parameter and cause (see B-65270EN). If DGN 203#4 = 0, read DGN 280 bits: MOT (2020), PLC (2023), PLS (2024), DIR (2022), AXS (1023). Start there before checking everything by hand." },
+      { title:"Check motor form 2020",
+        detail:"P2020 (motor format/ID number) must be a valid FANUC motor code within range. Wrong or blank after a motor swap is the most common trigger. Set it to match the motor nameplate." },
+      { title:"Check motor direction 2022",
+        detail:"P2022 (motor rotation direction) must be exactly 111 or -111 — any other value is illegal and trips this alarm." },
+      { title:"Check feedback pulses 2023 / 2024",
+        detail:"P2023 (velocity feedback pulses) and P2024 (position feedback pulses) must be greater than 0. A zero or negative value (common after a partial parameter load) is illegal." },
+      { title:"Check axis number 1023 and flexible feed gear 2084/2085",
+        detail:"P1023 (servo axis number) must be within 1..number-of-controlled-axes and consecutive (no gaps — e.g. no 4 without a 3). P2084/2085 (flexible feed gear) must be set, not left at 0." },
+      { title:"PMC-axis torque control — check the torque constant",
+        detail:"If the axis uses PMC-axis torque control, its torque-constant parameter must not be 0. A zero torque constant is one of the documented illegal conditions." },
+      { title:"Set observer 2047 = 0, then re-do servo initial setting",
+        detail:"Manual procedure: set P2047 (observer parameter) to 0, then perform the digital-servo initial setting (B-64115EN §6.1) to reload a consistent, valid parameter set. Re-verify against DGN 352/280 afterward." },
+    ],
+    source:"B-64115EN §5.4" },
+  { key:"sv420", codes:["420","SV0420"], title:"Sync Torque Difference Exceeded",
+    desc:"Torque difference between master and slave axes exceeded param 2031",
+    type:"SV", severity:"med",
+    summary:"In simple synchronous control (M series), the difference between the master and slave TORQUE commands exceeded parameter 2031. One axis is carrying much more load than its partner.",
+    context:"B-64115EN: during simple synchronous control, the difference between the torque commands for the master and slave axes exceeded parameter 2031. This is the torque-difference sibling of SV0407 (which watches the position/coordinate difference, 8314) — same synchronized master/slave pair, different quantity. A real torque imbalance means one side is doing more work: mechanical binding on one axis, unequal friction/preload, or mismatched servo tuning between the two.",
+    steps:[
+      { title:"Confirm it's the torque difference, not position (407)",
+        detail:"420 watches the master-vs-slave torque command (param 2031). If SV0407 is showing instead, that's the position/coordinate difference (8314) — a different check. Make sure you're on the right one." },
+      { title:"Check mechanical balance between the two axes",
+        detail:"The master and slave should carry roughly equal load. Look for uneven way lubrication, different guide preloads, or one side binding mechanically — that side's torque climbs and opens the difference." },
+      { title:"Compare motor currents on the servo tuning screen",
+        detail:"SYSTEM → [SV.PARA] → [SV.TUN]. Compare the current/torque readings for the two axes. A large, steady difference confirms a real mechanical imbalance and shows which side is loaded." },
+      { title:"Check servo tuning matches between the pair",
+        detail:"Both axes must have identical servo gains and time constants. A mismatch makes one respond differently and generate a torque difference even with no mechanical fault. Compare their servo parameter sets." },
+      { title:"Confirm the detection level 2031 against builder spec",
+        detail:"SYSTEM → PARAM → 2031 → NO.SRH. You can raise it briefly to confirm 420 is what's tripping, but restore it — find and fix the imbalance instead.",
+        warn:"Don't leave 2031 raised — it protects the machine from damage caused by an imbalanced synchronized pair." },
+    ],
+    source:"B-64115EN §5.4" },
+  { key:"sv421", codes:["421","SV0421"], title:"Excess Error — Dual Position Feedback",
+    desc:"Difference between semi-closed and closed loop positions excessive",
+    type:"SV", severity:"high",
+    summary:"Position difference between motor encoder and separate linear scale exceeded the semi-full error level.",
+    context:"In dual position feedback (semi-closed + closed loop), the CNC monitors the difference between the motor encoder position and the separate scale position. If this difference exceeds parameter 2118, this alarm fires. Causes: scale direction wrong, conversion coefficient wrong, or excessive backlash.",
+    steps:[
+      { title:"First setup or ran-fine before? — triage",
+        detail:"If 421 appears right after commissioning, a scale swap, or a parameter restore, suspect the conversion coefficient / direction (steps 2–3). If the machine ran fine and then started tripping, suspect the scale/mechanical side (steps 4–5). DGN 311#6 (DUA) flags that the semi-vs-full difference grew too large — confirms this is the dual-feedback comparison." },
+      { title:"Check the dual-feedback conversion coefficient (2078/2079)",
+        detail:"The manual's named check. SYSTEM → PARAM → 2078 (numerator) / 2079 (denominator) — the ratio between motor feedback and scale feedback pulses. A wrong value makes the two positions drift apart continuously." },
+      { title:"Check scale connection direction (2018#0 RVRSE)",
+        detail:"If the scale counts opposite to the motor encoder, the difference grows with every move. Set parameter 2018 bit 0 (RVRSE) to invert the separate detector direction if needed." },
+      { title:"Check the separate scale is healthy and reads motion",
+        detail:"Inspect the linear scale and its cable — dirt on the glass/read-head, coolant in the connector, or flex damage make the closed-loop position unreliable. Confirm the scale count actually changes as the axis moves, and check DGN 205 bits for separate-detector faults." },
+      { title:"Check for mechanical backlash motor-to-scale",
+        detail:"Backlash between the motor and the point the scale measures shows up as a position difference on every direction change. Inspect the coupling, ballscrew nut, and guide preload." },
+      { title:"Widen the semi-full detection level to confirm (2118)",
+        detail:"SYSTEM → PARAM → 2118 → NO.SRH. Raise it briefly — if the alarm clears, the deviation is real but bounded and you keep hunting the root cause. Restore it afterward; it protects against a genuine scale/mechanical fault.",
+        warn:"Don't leave 2118 widened — it exists to catch a real disagreement between motor and scale." },
+    ],
+    source:"B-65285EN §3.3.8" },
+  { key:"sv430", codes:["430","SV0430"], title:"Servo Motor Overheat",
+    desc:"Servo motor internal temperature exceeded threshold",
+    type:"SV", severity:"high",
+    summary:"Motor internal thermostat or thermistor detected excessive temperature. Overload, cooling failure, or sensor fault.",
+    context:"The motor temperature sensor (built into the motor windings) exceeded its threshold. Check DGN 308 for motor temperature and DGN 309 for pulsecoder temperature. If the alarm fires when the motor is not physically hot, the temperature detection circuit may be faulty.",
+    steps:[
+      { title:"Check if motor is actually hot",
+        detail:"Immediately after the alarm fires, feel the motor housing (carefully). If the motor is genuinely hot, the cause is thermal overload — continue to step 2. If the motor is cool, skip to step 5." },
+      { title:"Check motor cooling fan",
+        detail:"For fan-cooled motors: verify the fan is spinning and producing airflow. Check the fan power supply (voltage, phase sequence). Replace the fan if stopped." },
+      { title:"Check cutting conditions and duty cycle",
+        detail:"Heavy continuous cutting, rapid repeated accel/decel, or running above the motor's continuous rating causes overheating. Check the load meter history and reduce the duty cycle if needed." },
+      { title:"Check ambient temperature",
+        detail:"If the motor environment exceeds specification (typically 40°C for standard motors), cooling capacity is reduced. Improve ventilation around the motor." },
+      { title:"If motor is NOT hot — check temperature sensor circuit",
+        detail:"Read DGN 308 (motor temp) and DGN 309 (pulsecoder temp). If the reading is abnormally high but the motor is cool, the thermistor or its wiring in the feedback cable is faulty. Check the feedback cable connector for coolant ingress. Contact FANUC service if the sensor circuit is suspected." },
+    ],
+    source:"B-65285EN §3.3.5" },
+  { key:"sv431", codes:["431","SV0431"], title:"CNV Overload",
+    desc:"PSM overheat — converter main circuit overloaded",
+    type:"SV", severity:"high",
+    summary:"PSM heatsink temperature abnormally high. Main circuit cooling fan, dust, overload, or loose control PCB.",
+    context:"The PSM monitors its main circuit heatsink temperature. PSM code '3' means the heatsink is too hot. This is NOT the same as a control-side fan alarm (code 2/A). Common in dirty environments or when PSM is undersized for the connected load.",
+    steps:[
+      { title:"Check main circuit cooling fan operation",
+        detail:"Look at the fan on the PSM heatsink (rear/bottom of unit). Is it spinning? If stopped, check its power supply connector. Fans always blow upward. Replace if not spinning." },
+      { title:"Clean dust and debris from cooling system",
+        detail:"Use vacuum or factory air blower on the heatsink fins and fan intake. Accumulated dust is the most common cause — especially in casting/grinding environments." },
+      { title:"Check operating load conditions",
+        detail:"If the PSM is running near its capacity with many SVM/SPM modules connected, the heatsink will overheat under heavy simultaneous axis loads. Verify PSM model matches the total connected amp capacity." },
+      { title:"Push faceplate (control PCB) fully home",
+        detail:"A partially seated control PCB can cause false readings. Push the faceplate in until it clicks. This alarm can appear if the connector between the control PCB and power PCB is partially detached." },
+      { title:"Check ambient temperature",
+        detail:"If cabinet temperature exceeds specification (typically 55°C), the heatsink can't dissipate enough. Check cabinet fans, filters, and heat exchanger." },
+      { title:"Replace PSM if alarm persists",
+        detail:"If the fan is good, heatsink is clean, load is within spec, and ambient is normal — the temperature sensor circuit inside the PSM has likely failed. Replace the PSM." },
+    ],
+    source:"B-65285EN §3.1.4" },
+  { key:"sv432", codes:["432","SV0432"], title:"CNV Control Voltage Drop",
+    desc:"PSM control power supply voltage dropped below threshold",
+    type:"SV", severity:"high",
+    summary:"PSM internal 24V power supply abnormal — internal fuse blown or input voltage too low.",
+    context:"PSM code '6' means the 24V control power supply inside the PSM is failing. This 24V rail feeds all connected SVMs and SPMs via the CXA2A/B chain. If the PSM's internal fuse blows, every amp on the bus loses control power.",
+    steps:[
+      { title:"Check the 3-phase input voltage at the PSM",
+        detail:"Measure input at the PSM power terminals — it must not be below 85% of rated. A facility-supply sag pulls the internal 24V rail down with it." },
+      { title:"Do the downstream amps also show control-voltage-low?",
+        detail:"The PSM's 24V feeds every SVM/SPM over CXA2A/B. If the downstream amps show code 2 (control-voltage low) at the same time, the shared 24V from the PSM is the fault — stay on the PSM. If the PSM is fine but one downstream amp shows code 2, the CXA2A/B chain to that amp is the problem (see SV0434), not this." },
+      { title:"Check if it fires immediately at power-on",
+        detail:"If code 6 appears the instant control power comes on, before the machine initializes, the PSM itself is the suspect — internal control-power fuse or circuit." },
+      { title:"Check for a voltage-sag pattern",
+        detail:"If it only appears under heavy load or when other machines in the shop start, the facility supply is marginal. Put a recording meter on the input over a few hours." },
+      { title:"Measure the PSM 24V output / check the internal fuse",
+        detail:"Measure the 24V control output from the PSM — normal 24VDC, alarm threshold below ~22.8V. A blown internal control-power fuse or failed supply reads low here." },
+      { title:"Replace the PSM",
+        detail:"If the input voltage is good and the 24V rail is low at power-on, the PSM's internal control-power circuit or fuse has failed. Replace the PSM." },
+    ],
+    source:"B-65285EN §3.1.7" },
+  { key:"sv433", codes:["433","SV0433"], title:"CNV DC Link Voltage Drop",
+    desc:"Converter (PS) DC link undervoltage, PS code 4 — link sagged while running",
+    type:"SV", severity:"high",
+    summary:"DC link voltage sagged during operation — PS code 4.",
+    context:"Different from code 5 (won't charge at startup) — code 4 drops while the machine is running. Usually a momentary supply dip or a low line, sometimes main power cut mid-sequence.",
+    steps:[
+      { title:"Intermittent, tied to heavy load or other machines starting?",
+        detail:"If it comes and goes under heavy cutting or when large machines nearby start up, the facility supply is dipping. Put a recording meter on the input over a few hours." },
+      { title:"Measure the 3-phase input",
+        detail:"Line must stay above about 85% of rated. A sustained low line won't hold the DC link up." },
+      { title:"Does more than one module report low DC link?",
+        detail:"If several amps show low DC link together, the fault is upstream — the PS or the input supply (work it here). If only one SVM shows its DC-link-low code (5), that's local to that amplifier (SV0435), not the PS." },
+      { title:"Measure the DC link voltage at the PS P/N terminals",
+        detail:"Under no load it should be roughly 283–339 VDC on a 200V-class αiPS, or 537–679 VDC on an HV (400V) αiPS. A reading well below that with the input good points at the PS.",
+        warn:"Confirm the DC link has discharged to a safe level before touching any P/N terminal." },
+      { title:"Check the power-off / E-stop sequence",
+        detail:"The main contactor (MCC) must stay closed until the axes have stopped. Cutting main power with E-stop released drops the link mid-run and trips this." },
+      { title:"Supply confirmed stable but it still trips — it's the PS",
+        detail:"Input good and steady, DC link still sags → the PS is faulty. Bring it to the lab for repair, or swap in a working unit." },
+    ],
+    source:"B-65285EN §3.1.5" },
+  { key:"sv434", codes:["434","SV0434"], title:"INV Control Voltage Drop",
+    desc:"SVM control power supply voltage dropped — check 24V from PSM",
+    type:"SV", severity:"high",
+    summary:"SVM receiving insufficient 24V control power from PSM. CXA2A/B chain, input voltage, or SVM failure.",
+    context:"The SVM gets its 24VDC via the CXA2A/B daisy-chain from the PSM. SVM code '2' means this 24V rail has dropped below ~22.8V at the SVM. Unlike PSM code 6, this points more at the connection chain between PSM and SVM rather than the PSM supply itself.",
+    steps:[
+      { title:"Check 3-phase input voltage",
+        detail:"Measure input voltage at the PSM. Must not be lower than 85% of rated input voltage. Low facility voltage pulls the entire 24V rail down." },
+      { title:"Check PSM 24V output",
+        detail:"Measure the 24V output from the PSM. Normal is 24VDC; alarm threshold is below ~22.8V. If PSM output is low, the PSM itself is the problem — see SV0432." },
+      { title:"Check CXA2A/B connector and cable chain",
+        detail:"The 24V travels through the CXA2A/B connectors daisy-chaining from PSM to each SVM. Check for loose connectors, corroded pins, or damaged cables. A bad connection on one link drops voltage for all downstream units." },
+      { title:"Check if only one SVM shows this alarm",
+        detail:"If only one SVM has code '2' and others are fine, the problem is local to that SVM or its CXA2A/B connection. If multiple SVMs show code '2', look upstream at the PSM." },
+      { title:"Replace the SVM",
+        detail:"If the 24V supply and CXA2A/B chain are good but one SVM keeps showing code '2', the SVM's internal power circuit has failed. Replace that SVM." },
+    ],
+    source:"B-65285EN §3.2.2" },
+  { key:"sv435", codes:["435","SV0435"], title:"INV DC Link Voltage Drop",
+    desc:"SVM DC link voltage dropped — check input voltage and DC bus",
+    type:"SV", severity:"high",
+    summary:"SVM detected DC link voltage drop. Check DC link bar connections, input voltage, or SVM failure.",
+    context:"SVM code '5' means the DC link voltage (shared via copper busbars from PSM) dropped at this SVM. If multiple SVMs show '5', it's a PSM/input problem. If only one SVM shows '5', it's a local connection or SVM failure.",
+    steps:[
+      { title:"Check DC link bar connection screws",
+        detail:"The DC link connects PSM to each SVM via copper busbars. Check that the screws at each connection point are tight. A loose busbar connection causes voltage drop under load — this is a common cause." },
+      { title:"Check if multiple SVMs show this alarm",
+        detail:"If more than one SVM shows code '5', the problem is upstream at the PSM. See PSM DC-link-low (SV0433) — check input voltage, power dips, and PSM condition. If only this SVM shows '5', the fault is local (busbar or SVM)." },
+      { title:"Measure the DC link voltage at the affected SVM",
+        detail:"Measure across the SVM DC-link terminals. Under normal operation expect roughly 283–339 VDC on a 200V-class system, 537–679 VDC on an HV (400V) system. A low reading here with the PSM output good points at the busbar connection into this SVM.",
+        warn:"Confirm the DC link has discharged to a safe level before touching any DC-link terminal." },
+      { title:"Push faceplate (control PCB) fully home on the affected SVM",
+        detail:"If only one SVM shows code '5', push its faceplate in until it clicks. A partially seated control PCB can cause a false DC link reading." },
+      { title:"Replace the affected SVM",
+        detail:"If the busbar connections are tight, input voltage is stable, the DC link reads normal, and the faceplate is fully seated — the SVM has an internal failure. Replace it." },
+    ],
+    source:"B-65285EN §3.2.3" },
+  { key:"sv436", codes:["436","SV0436"], title:"Soft Thermal OVC",
+    desc:"Digital servo software detected soft thermal overload state",
+    type:"SV", severity:"high",
+    summary:"Servo software calculated that motor current has exceeded the continuous rating for too long. Software-based motor protection.",
+    context:"This is a calculated alarm — the servo software models the motor's thermal state based on actual current flow. When the modeled temperature exceeds the limit, this alarm fires even if no physical temperature sensor has tripped. Check for motor vibration, incorrect parameters, or genuinely excessive load.",
+    steps:[
+      { title:"Check if motor is vibrating",
+        detail:"A vibrating motor draws excessive current even under light load. Feel for vibration and listen for unusual noise. Vibration causes are typically servo gain mismatch, mechanical resonance, or encoder issues." },
+      { title:"Verify motor power cable is connected correctly",
+        detail:"Incorrect phase connection causes abnormal current flow and triggers the soft thermal. Verify U/V/W connections match the motor and amplifier labels." },
+      { title:"Check OVC parameters are at standard values",
+        detail:"Parameters 2062, 2063, 2065 (0i series) control the overload protection calculation. Verify they match the FANUC Parameter Manual (B-65270EN) standard values for this motor type. Incorrect values cause premature or delayed OVC trips." },
+      { title:"Measure actual motor current",
+        detail:"Use the servo tuning screen (SYSTEM → [SV.PARA] → [SV.TUN]) to observe motor current during operation. Compare against the motor's continuous rating. If current is consistently high, reduce the cutting load or increase accel/decel time constants." },
+      { title:"Check if load is genuinely excessive",
+        detail:"Compare actual current against the motor's overload duty curves (B-65262EN). If the duty cycle exceeds the motor's capacity, the machine needs a lighter cutting program or a larger motor." },
+    ],
+    source:"B-65285EN §3.3.3" },
+  { key:"sv437", codes:["437","SV0437"], title:"CNV Overcurrent",
+    desc:"Converter (PS) input overcurrent, PS code 1 — usually the PS itself",
+    type:"SV", severity:"high",
+    summary:"Overcurrent on the converter (PS) input — shown as PS code 1.",
+    context:"In most cases the PS itself is at fault. The one thing that splits it fast is WHEN the alarm appears — immediately at power-up, or only when the PS closes the contactor.",
+    steps:[
+      { title:"Watch when the alarm appears",
+        detail:"Immediately at power-up, before the contactor closes → the fault is inside the PS. It has to come out for repair, or swap in a known-good unit. Only when the PS closes the main contactor (MCC) → the PS is fine to that point; check the input phases and the contactor itself (next step)." },
+      { title:"If it trips on contactor close — check phases and contactor",
+        detail:"Measure all three phases at the PS input; a lost or weak phase, or an imbalance between phases, can trip it. Inspect the main contactor for welded, pitted, or chattering contacts." },
+      { title:"Check the AC reactor and its wiring",
+        detail:"Every αiPS runs through a matched AC line reactor. Confirm the reactor is the correct one for this converter and that its connections are tight — a wrong-spec, open, or shorted reactor, or a loose lug, drives input overcurrent on contactor close. Look for discolouration or a burnt smell at the reactor terminals." },
+      { title:"Reseat the control PCB (αiPS only)",
+        detail:"On αiPS the control board slides out — reseat it fully. Small chance, but worth ruling out before condemning the unit." },
+      { title:"Otherwise it's the PS — bring it in",
+        detail:"Alarms immediately, or the input and contactor both check out → the converter is faulty. Bring the PS to the lab for repair, or swap in a working unit. Do not attempt IGBT/IPM replacement in the field." },
+    ],
+    source:"B-65285EN §3.1.2" },
+  { key:"sv438", codes:["438","SV0438"], title:"INV Abnormal Current",
+    desc:"Motor current too high in SVM — check motor and power cable insulation",
+    type:"SV", severity:"high",
+    summary:"SVM detected abnormal motor current. Usually a short/ground fault in the motor windings or power leads; sometimes wrong motor ID / servo parameters, or harsh accel/decel. LED shows b (L axis), c (M axis), or d (N axis). The amp isolates which axis by the letter.",
+    context:"b/c/d is the motor-current-side detection (the winding side), as opposed to '8/9/A' which is the DC-link side (SV0600). Triage by when it trips: a hard short trips immediately every time; a parameter/duty problem trips only on rapid accel/decel. Work the cheap causes first, then disconnect-and-megger to split amp vs motor vs cable.",
+    steps:[
+      { title:"Note when it trips — immediately, or only on rapid accel/decel?",
+        detail:"A hard short or ground fault trips the instant the axis is enabled, every time. If it only trips on rapid traverse or hard accel/decel, treat it as a duty/parameter problem first (next two steps) before tearing into the power side." },
+      { title:"If only on rapid accel/decel — ease the duty",
+        detail:"The motor is being pushed too hard for the move. Increase the acceleration/deceleration time constant and retest. If that clears it, the wiring is fine." },
+      { title:"Check the servo parameters are at default",
+        detail:"Verify these are at their default values per B-65270EN. Series 15i: 1809, 1852, 1853. Series 16i/18i/20i/21i/0i and Power Mate i: 2004, 2040, 2041. A wrong motor ID or current-loop parameter makes the loop demand excess current — most likely right after a motor swap or parameter restore." },
+      { title:"Reseat the faceplate (control PCB) fully home",
+        detail:"A partially seated control board can throw a false current alarm. Push the faceplate all the way in before condemning any power-side part." },
+      { title:"Disconnect the motor power leads and release E-stop",
+        detail:"Pull U/V/W off the amp, then release E-stop and let the drive initialize. If the alarm STILL fires with the motor disconnected → the amp power stage is faulty, replace the SVM. If it clears → the fault is downstream in the motor or cable.",
+        warn:"Confirm the DC link is discharged before touching any power terminals." },
+      { title:"Megger to split cable vs motor",
+        detail:"Megger PE to each phase (U/V/W). If insulation is degraded, disconnect the cable at the motor terminal box and megger the cable alone and the motor alone. Coolant ingress at the motor box is the classic cause of a bad winding." },
+      { title:"Replace the failed part",
+        detail:"Degraded motor winding → replace the motor. Degraded cable → replace the cable. Everything clean but the alarm returns with leads off → replace the SVM." },
+    ],
+    result:"Motor and cable megger clean and the alarm stays clear on normal accel/decel — the axis holds current without tripping.",
+    source:"B-65285EN §3.2.10" },
+  { key:"sv439", codes:["439","SV0439"], title:"CNV Overvoltage",
+    desc:"Converter (PS) DC link overvoltage, PS code 7 — energy coming back too fast",
+    type:"SV", severity:"high",
+    summary:"DC link voltage too high — PS code 7. Energy is returning faster than the PS can absorb it.",
+    context:"Usually shows on hard deceleration of a heavy spindle or axis, or if main power drops while the drive is still decelerating. The PS size and any regen hardware were set by the MTB — that's not something you change in the field.",
+    steps:[
+      { title:"Note when it trips — on hard decel, or on E-stop?",
+        detail:"Trips on hard deceleration / spindle stop → the regen energy path. Trips on E-stop or power-off → look at the sequence first (next step)." },
+      { title:"Check the power-off / E-stop sequence",
+        detail:"The main contactor (MCC) must stay closed until the axes and spindle have stopped. If the sequence cuts main power while the drive is still decelerating, the link spikes — that's a PLC/sequence fault and it's fixable." },
+      { title:"Check the incoming supply",
+        detail:"Measure the 3-phase line. A high or unstable line raises the DC-link baseline; voltage swing at full output should stay within about 7%." },
+      { title:"Trips on hard decel with no regen option — ease the decel",
+        detail:"If it only trips on heavy deceleration and the machine has no regen (PSMR) hardware, the decel is returning more energy than a plain PS can hold. As an interim, lengthen the rapid/spindle deceleration time so the link doesn't spike, and confirm PS sizing / regen option with the machine builder." },
+      { title:"Otherwise it's the PS — bring it in",
+        detail:"Sequence and supply check out and it still trips 7 → the PS is faulty. Bring it to the lab for repair, or swap in a working unit." },
+    ],
+    source:"B-65285EN §3.1.8" },
+  { key:"sv440", codes:["440","SV0440"], title:"CNV Excess Deceleration Power",
+    desc:"PSMR regenerative discharge amount too large",
+    type:"SV", severity:"high",
+    summary:"PSMR regenerative resistor overheated. Insufficient resistor capacity, excessive accel/decel duty, or resistor wiring/cooling fault. αiPSR only.",
+    context:"PSM code 'H' only appears on PSMR units (with external regenerative resistors). It means the resistor temperature is abnormally high — the machine is dumping more energy into the resistor than it can dissipate. This is not the same as code '7' (overvoltage) — here the resistor is absorbing the energy but overheating.",
+    steps:[
+      { title:"Check regenerative resistance wiring",
+        detail:"Verify the regenerative resistor is properly connected to the PSMR. A disconnected or high-resistance connection can cause localized overheating." },
+      { title:"Check regenerative resistor specification",
+        detail:"Verify the resistor rating matches the PSMR requirements. An undersized resistor will overheat under normal operation." },
+      { title:"Reduce acceleration/deceleration frequency",
+        detail:"If the machine does rapid repeated accel/decel cycles (e.g., high-speed tapping), the regenerative resistor may not have time to cool between cycles. Reduce the duty cycle or increase cycle time." },
+      { title:"Check regenerative resistor cooling fan",
+        detail:"If the resistor has its own cooling fan, verify it is running. A stopped fan drastically reduces the resistor's thermal capacity." },
+      { title:"Replace PSMR if resistor and cooling are correct",
+        detail:"If the resistor is correctly sized, properly wired, and adequately cooled, the PSMR's internal regenerative control circuit may be faulty. Replace the PSMR." },
+    ],
+    source:"B-65285EN §3.1.12" },
+  { key:"sv441", codes:["441","SV0441"], title:"Abnormal Current Offset",
+    desc:"Digital servo detected abnormality in motor current detection circuit",
+    type:"SV", severity:"high",
+    summary:"Current offset value of the current detector is abnormally high at E-stop. Current detector or amplifier failure.",
+    context:"This alarm is detected by servo software, not by the amplifier LED. The servo checks the current sensor offset (the reading that should be zero when no current flows). If the offset is too large, current control will be inaccurate and potentially dangerous.",
+    steps:[
+      { title:"Understand what's checked — the zero-current offset",
+        detail:"The servo measures the current-sensor reading at E-stop, when no current should be flowing. If that 'zero' reading is too far off, the alarm fires. So it's an at-rest/power-on check, not something you provoke by moving the axis — the fault is in the sensing, not the load." },
+      { title:"Cycle power",
+        detail:"Turn off CNC power, wait 10 seconds, power back on. If the alarm clears and doesn't return, it was a transient glitch — monitor but no repair needed." },
+      { title:"Check if alarm fires consistently",
+        detail:"If this alarm fires every time the power is turned on, the current detection circuit inside the SVM is faulty. The offset error is permanent." },
+      { title:"Check the SVM faceplate seating",
+        detail:"Push the SVM control PCB faceplate fully home. A partially seated board can cause incorrect current sensing." },
+      { title:"Replace the SVM",
+        detail:"If the alarm persists after power cycle and faceplate re-seating, the internal current sensor or its associated circuit has failed. For αi series, the sensor is not field-replaceable — replace the entire SVM." },
+    ],
+    source:"B-65285EN §3.3.8" },
+  { key:"sv442", codes:["442","SV0442"], title:"CNV Charge Failure",
+    desc:"Converter (PS) DC link precharge failure, PS code 5 — link won't come up at power-on",
+    type:"SV", severity:"high",
+    summary:"The PS couldn't charge the DC link to voltage at power-on — PS code 5. The manual points at the soft-charge (precharge) circuit of the DC link.",
+    context:"At power-up the PS charges the DC-link caps through a soft-charge (current-limiting) resistor before the main contactor takes over. If a phase is missing, something is loading/shorting the bus, or that soft-charge circuit itself is faulty, the link never reaches voltage and trips code 5. A downstream amp shorting the link is the classic field cause.",
+    steps:[
+      { title:"Confirm it trips at power-up, before run",
+        detail:"Code 5 fires during the initial charge, not while running. If so, work the DC link and the charge circuit — that's where the fault is." },
+      { title:"Check all three input phases are present at the PS",
+        detail:"Measure the 3-phase input at the PS terminals. A missing or weak phase means the caps can't charge to voltage — chase the dead phase back through the fuse, contactor, and breaker before suspecting the PS." },
+      { title:"Isolate the DC link",
+        detail:"With the link discharged, disconnect the DC busbars to the SVMs/SPMs and power the PS alone. Charges OK now → reconnect one amp at a time until the alarm returns; that unit is shorting the bus. Still fails with everything off → the fault is in the PS.",
+        warn:"Confirm the DC link is fully discharged before touching any busbar." },
+      { title:"Downstream unit shorting the bus → that unit",
+        detail:"If reconnecting a specific SVM/SPM brings the alarm back, that amp (or its motor/cable) is shorting the link. Megger that motor and cable; replace the shorted amp if the fault is internal." },
+      { title:"PS alone still won't charge — it's the soft-charge circuit / PS",
+        detail:"Nothing downstream loading the link and it still trips 5 → the PS's soft-charge circuit (current-limiting resistor or its relay) is abnormal. Bring the PS to the lab for repair, or swap in a working unit." },
+    ],
+    source:"B-65285EN §3.1.6" },
+  {
+    key: "psfan",
+    codes: ["443","610","SV0443","SV0610"],
+    title: "CNV. Cooling Fan Failure",
+    desc: "PS (converter) cooling fan stopped — often shows against several axes and the spindle at once",
+    type: "SV", severity: "high",
+    summary:"The converter (PS) cooling fan has stopped. Per the manual this is the PS internal stirring fan. Because it's a converter-level fault, it can surface against multiple axes and the spindle together — it's one fan, not many faults.",
+    context:"B-64115EN/B-65285EN: PS code 2 is the internal stirring fan on the Power Supply. This is NOT the external radiator (heatsink) fan — that's PS code A (SV0606). The manual's first cause is a poorly-seated control PCB: if the faceplate isn't fully home, the connector between the control and power PCB can be unmated and read as a stopped fan. So reseat before condemning the fan.",
+    steps:[
+      { title:"Confirm it's a converter fault, not one axis",
+        detail:"A PS fan alarm can appear against several axes and the spindle at the same time because they all share the one Power Supply. Read the PS 7-segment — the fan alarm lives there. Don't chase individual axes." },
+      { title:"Check for foreign material in the fan",
+        detail:"Look through the vents for chips, debris, cable ties, or insulation fouling the blades. Even a small obstruction stalls these fans. Spin it by hand to feel for a seized bearing." },
+      { title:"Push the faceplate (control PCB) fully home",
+        detail:"The manual's primary cause. Press the PS control PCB in until it clicks — the fan connector and the control-to-power-PCB connectors only mate when it's fully seated. A half-seated board reads as a stopped fan." },
+      { title:"Check the fan connector",
+        detail:"Remove the faceplate and confirm the fan cable connector is firmly seated on its header. Reseat it. Look for a detached connector between the control PCB and the power PCB." },
+      { title:"Replace the fan",
+        detail:"If the fan won't run with clear blades and a good connection, the fan motor has failed. Fit the correct FANUC replacement fan." },
+      { title:"Replace the PS",
+        detail:"If a known-good fan still throws the alarm, the fan-drive/monitoring circuit on the PS control PCB has failed — replace the control PCB or the PS. (For the external radiator fan instead, see SV0606, PS code A.)" },
+    ],
+    source:"B-65285EN §3.1 (PS internal fan)" },
+  { key:"sv444", codes:["444","SV0444"], title:"INV Cooling Fan Failure",
+    desc:"SVM internal stirring fan failed — check fan and connector",
+    type:"SV", severity:"high",
+    summary:"SVM internal cooling fan stopped. Foreign material, loose connector, fan motor failure, or SVM board fault.",
+    context:"SVM code '1' is the internal stirring fan (the small fan on the control PCB side). This is NOT the external heatsink fan (code F). Fans always blow upward. A stopped internal fan will cause the SVM electronics to overheat and eventually fail if not addressed.",
+    steps:[
+      { title:"Check for foreign material in the fan",
+        detail:"Look through the vents for debris, cable ties, or insulation blocking the fan blades. Even a small piece of debris can stall these small fans." },
+      { title:"Push faceplate (control PCB) fully home",
+        detail:"The fan connector mates when the faceplate is pushed in. If the faceplate is not fully seated, the fan connector may be partially disconnected. Push it in until it clicks." },
+      { title:"Check fan connector is properly attached",
+        detail:"Remove the faceplate and check that the fan cable connector is fully seated on the PCB header. Reseat it firmly." },
+      { title:"Replace the fan",
+        detail:"If the fan doesn't spin with clear blades and a good connection, the fan motor has failed. Replace with the correct FANUC replacement fan." },
+      { title:"Replace the SVM",
+        detail:"If a new fan still doesn't spin, or if the alarm persists with a known-good fan, the SVM's fan drive circuit on the control PCB has failed. Replace the SVM." },
+    ],
+    source:"B-65285EN §3.2.1" },
+  { key:"sv445", codes:["445","SV0445"], title:"Soft Disconnect Alarm",
+    desc:"Digital servo software detected broken wire in pulse coder",
+    type:"SV", severity:"high",
+    summary:"Servo software detected position feedback pulses are too small relative to velocity feedback. Encoder cable, encoder, or backlash issue.",
+    context:"This alarm fires when the closed-loop position feedback variation is too small compared to the velocity feedback. It means the motor is turning but the position sensor isn't reporting proportional movement — classic broken wire, failing encoder, or extreme mechanical backlash between motor and scale.",
+    steps:[
+      { title:"Check feedback cable for damage",
+        detail:"Inspect the encoder feedback cable from motor to SVM. Look for crushed sections, cuts, loose connectors, and coolant ingress at connectors. Flex the cable while monitoring — intermittent faults often show up during motion." },
+      { title:"Check separate detector operation (if dual feedback)",
+        detail:"If using a separate serial scale/encoder for position feedback, verify it outputs pulses correctly. A failing scale head or dirty linear scale can cause this alarm." },
+      { title:"Adjust soft disconnection alarm detection level",
+        detail:"If this alarm fires due to large backlash between motor and separate scale, increase the detection level in parameter 2064 (0i/16i/18i). Standard value is 4 (alarm at 1/8 motor rotation difference). Increase to allow larger difference — but understand this reduces protection.",
+        warn:"Increasing the detection level reduces the servo's ability to detect a genuine disconnection. Only do this if you understand the mechanical backlash is the real cause." },
+      { title:"Check parameter 2003 bit 1 (TGAL)",
+        detail:"If TGAL (#1) = 1, the soft disconnection level uses parameter 2064. If TGAL = 0, a fixed default level is used. Set TGAL = 1 and parameter 2064 appropriately if the default level is too sensitive." },
+      { title:"Replace encoder cable or encoder",
+        detail:"If the cable is damaged or the encoder is failing (intermittent or no feedback), replace the defective component. Replacing encoders does NOT require motor replacement." },
+    ],
+    source:"B-65285EN §3.3.4" },
+  { key:"sv446", codes:["446","SV0446"], title:"Hard Disconnect Alarm (built-in)",
+    desc:"Hardware detected broken wire in built-in pulse coder",
+    type:"SV", severity:"high",
+    summary:"Built-in pulsecoder hardware detected complete signal loss. Feedback cable or pulsecoder failure.",
+    context:"Unlike the soft disconnect (SV0445), this is a hardware-level detection — the signal dropped completely. The pulsecoder hardware circuit detected a broken wire or total signal loss. This alarm is not issued on all CNC series.",
+    steps:[
+      { title:"Check feedback cable from motor to amplifier",
+        detail:"Inspect the entire feedback cable run for crushed, cut, or damaged sections. Check connectors at both ends — motor side and SVM side — for loose pins, corrosion, or coolant ingress." },
+      { title:"Check for coolant ingress at motor connector",
+        detail:"Cutting fluid penetrating the motor-end feedback connector is a very common cause. Clean and dry the connector thoroughly. If the connector housing is cracked, replace the cable." },
+      { title:"Power cycle and check if alarm is persistent",
+        detail:"Turn off CNC, wait 30 seconds, power on. If the alarm clears = intermittent cable fault (often at a flex point). If persistent = pulsecoder or cable failure." },
+      { title:"Replace feedback cable",
+        detail:"If the cable shows any damage or the alarm is intermittent with cable movement, replace the feedback cable." },
+      { title:"Replace the pulsecoder",
+        detail:"If a new cable does not fix the alarm, the pulsecoder inside the motor has failed. Replace the pulsecoder. After replacement, perform reference position return." },
+    ],
+    source:"B-65285EN §3.3.4" },
+  { key:"sv447", codes:["447","SV0447"], title:"Hard Disconnect Alarm (separate)",
+    desc:"Hardware detected broken wire in separate detector (linear scale etc.)",
+    type:"SV", severity:"high",
+    summary:"Separate phase A/B scale hardware disconnection detected. Cable, scale head, or connection fault.",
+    context:"This alarm fires when the separate A/B phase detector (linear scale) hardware detects a signal loss. Unlike the soft disconnect (SV0445), this is a hard hardware detection — the signal dropped completely, not just became inconsistent.",
+    steps:[
+      { title:"Check if the phase A/B scale is connected correctly",
+        detail:"Verify the separate detector cable is properly connected at both ends — at the scale head and at the SVM. Check for loose connectors or bent pins." },
+      { title:"Inspect cable for damage",
+        detail:"Look for crushed, cut, or kinked cable along its entire run. Linear scale cables on moving axes are particularly prone to flex damage. Check inside cable carriers." },
+      { title:"Check for coolant ingress at connectors",
+        detail:"Coolant penetrating into the scale head connector or the cable junction is a common cause. Clean and dry the connector if contaminated." },
+      { title:"Verify scale head and reading",
+        detail:"If the cable and connectors are good, the scale head itself may be failing. Check the signal output with an oscilloscope if available, or swap with a known-good unit." },
+      { title:"Replace cable or scale",
+        detail:"Replace the damaged cable or failing scale head. If the alarm persists with known-good scale and cable, the SVM's feedback input circuit may be faulty." },
+    ],
+    source:"B-65285EN §3.3.4" },
+  { key:"sv448", codes:["448","SV0448"], title:"Unmatched Feedback Alarm",
+    desc:"Sign of feedback from built-in and separate detectors differs",
+    type:"SV", severity:"high",
+    summary:"Motor encoder and separate scale are reporting opposite directions of motion. Wrong rotation direction setting or scale connection.",
+    context:"This alarm fires when the motor position detector moves in one direction but the separate position detector (linear scale) reports the opposite direction. This means either the scale is connected backwards, or the motor encoder direction is inverted relative to the scale.",
+    steps:[
+      { title:"Check separate detector rotation direction",
+        detail:"Verify the separate detector reports the same direction of motion as the motor encoder. If they're opposite, the scale connection needs to be corrected." },
+      { title:"For phase A/B detector — swap A and A̅ connections",
+        detail:"If using a separate phase A/B detector, reversing the A and A̅ signal connections will invert the direction." },
+      { title:"For serial detector — invert direction parameter",
+        detail:"Set parameter 2018 bit 0 (RVRSE) to reverse the signal direction of the separate serial detector. RVRSE=0: normal, RVRSE=1: reversed." },
+      { title:"Check for large mechanical backlash",
+        detail:"If the motor-to-scale coupling has extreme backlash, rapid direction changes can trip this momentarily. There is a servo bit parameter that sets the speed at which the mismatch is detected — confirm its exact number for your control in B-65270EN before changing it, and fix the backlash rather than just relaxing detection." },
+      { title:"Verify dual position feedback conversion coefficient",
+        detail:"Check parameters 2078 (numerator) and 2079 (denominator) for the dual position feedback conversion. Incorrect values can cause the comparison to misinterpret direction." },
+    ],
+    source:"B-65285EN §3.3.8" },
+  { key:"sv449", codes:["449","SV0449"], title:"INV IPM Alarm",
+    desc:"SVM intelligent power module detected alarm — check motor and cable insulation",
+    type:"SV", severity:"high",
+    summary:"SVM IPM (intelligent power module) alarm. Motor/cable insulation fault, SVM failure, or overheat condition. Decimal dot on display distinguishes from plain '8'. LED shows 8. (L), 9. (M), or A. (N axis).",
+    context:"SVM codes 8./9./A. (with decimal dot) indicate the IPM detected a fault. There are TWO variants of this alarm: overcurrent/short (§3.2.8) and overheat (§3.2.9). The CNC alarm number is the same (SV0449) for both, but the cause and troubleshooting differ. Check the conditions: if the motor was under heavy load → overheat variant. If the alarm fired suddenly → short/insulation variant.",
+    steps:[
+      { title:"Push faceplate (control PCB) fully home",
+        detail:"A partially seated control PCB can cause false IPM alarms. Push it in firmly until it clicks. This applies to both the overcurrent and overheat variants." },
+      { title:"Determine variant: overcurrent or overheat",
+        detail:"If the alarm fired under heavy cutting or after prolonged high-duty operation → likely overheat (check step 3-5 below). If the alarm fired suddenly or at startup → likely overcurrent/short (check step 6-8 below)." },
+      { title:"Overheat: check heatsink cooling fan",
+        detail:"Verify the SVM heatsink fan is running. A stopped fan lets the IPM overheat even under normal load." },
+      { title:"Overheat: check motor usage within continuous rating",
+        detail:"If the motor consistently runs above its continuous rating, the SVM will overheat. Check load meter readings and reduce duty cycle if needed." },
+      { title:"Overheat: check cabinet cooling and ambient temperature",
+        detail:"Inspect cabinet fans, filters, and heat exchangers. High ambient temperature reduces the SVM's thermal margin." },
+      { title:"Short: disconnect motor leads and release E-stop",
+        detail:"Disconnect U/V/W motor power cable from the SVM. Release E-stop. If the IPM alarm still fires → SVM failure, replace the SVM." },
+      { title:"Short: megger test motor and power cable",
+        detail:"Check insulation between PE and each motor power lead (U, V, W). If insulation is degraded, disconnect motor from cable and test each separately. Replace the component with failed insulation.",
+        warn:"Confirm DC link is discharged before disconnecting any power terminals." },
+      { title:"Replace SVM if all external checks pass",
+        detail:"If motor and cable insulation are good, faceplate is seated, and the alarm still fires — the IPM inside the SVM has failed. Replace the SVM." },
+    ],
+    source:"B-65285EN §3.2.8, §3.2.9" },
+  { key:"sv453", codes:["453","SV0453"], title:"Pulsecoder Soft Disconnect (α)",
+    desc:"Position-pole data error in α pulsecoder — pulsecoder failure or cutting fluid ingress. Replace pulsecoder",
+    type:"SV", severity:"high",
+    summary:"α pulsecoder lost synchronization between absolute position data and phase data. Pulsecoder failure or contamination.",
+    context:"This alarm fires when the built-in α pulsecoder detects that its absolute position data and phase data are no longer synchronized. This is specific to α series pulsecoders. Common cause is cutting fluid ingress into the motor or pulsecoder connector.",
+    steps:[
+      { title:"Know what 453 is — a pulsecoder data desync, not a plain broken wire",
+        detail:"Unlike the disconnect alarms (445/446/447, which are broken-wire/signal-loss), 453 is the α pulsecoder reporting its own absolute-position and phase data no longer agree. That points inside the pulsecoder or at contamination reaching it — most often coolant ingress — rather than at a cut cable." },
+      { title:"Power off, disconnect and reconnect the pulsecoder cable",
+        detail:"Turn off CNC completely. Disconnect the pulsecoder (feedback) cable at the motor connector. Inspect for moisture, coolant, or contamination. Clean and dry. Reconnect firmly. Power on." },
+      { title:"Check for cutting fluid ingress",
+        detail:"Look for signs of coolant penetration at the motor rear (where the pulsecoder is mounted). Discolouration, moisture, or white deposits on the connector indicate contamination. Clean thoroughly with contact cleaner." },
+      { title:"Power cycle and check if alarm clears",
+        detail:"If the alarm clears after reconnecting and does not return, it was a connection issue. If it returns immediately, the pulsecoder has failed internally." },
+      { title:"Replace the pulsecoder",
+        detail:"If the alarm persists after cable reconnection and cleaning, the pulsecoder has lost its internal synchronization and must be replaced. After replacement, perform reference position return (zero return) for the affected axis." },
+    ],
+    source:"B-65285EN §3.3.4" },
+  { key:"sv456", codes:["456","SV0456"], title:"Illegal Current Loop",
+    desc:"Current control cycle settings incorrect — check params 2004/2003/2013",
+    type:"SV", severity:"high",
+    summary:"The current-control-loop cycle setting is illegal. Parameter error only — not a hardware fault. Fires at power-on.",
+    context:"This fires at power-on when the current-loop timing / HRV setting is outside the allowable range. It is always a parameter problem, and almost always follows a parameter restore, an HRV (high-response current control) option change, or a manual edit — not a random event.",
+    steps:[
+      { title:"Check what changed just before it appeared",
+        detail:"456 follows a service action nearly every time — a parameter restore from the wrong file, an HRV/current-control option toggled, or a hand edit. Establish what was touched first." },
+      { title:"Check the current-control-cycle parameter (2004)",
+        detail:"SYSTEM → PARAM → 2004 → NO.SRH — the current control cycle. Verify it against the standard value for this amplifier/motor in the servo parameter manual B-65270EN. An out-of-range value here is the usual cause." },
+      { title:"Check the related current-loop / HRV parameters",
+        detail:"Other current-loop and HRV-related servo parameters must be consistent with 2004 and with the installed option. Confirm the whole current-loop group against B-65270EN for this control rather than changing single bits by guess." },
+      { title:"Restore a verified parameter backup",
+        detail:"If a known-good backup exists, restore the full servo parameter set and power-cycle. This clears a corrupted or mismatched current-loop setting in one move." },
+      { title:"If no backup — re-do servo initial setting",
+        detail:"With no backup, perform the digital-servo initial setting (B-64115EN §6.1) so the current-loop parameters are regenerated to valid values for the motor/amplifier." },
+    ],
+    source:"B-64115EN §5.4" },
+  { key:"sv460", codes:["460","SV0460"], title:"FSSB Disconnect",
+    desc:"FSSB optical communication disconnected suddenly — check fiber cable",
+    type:"SV", severity:"high",
+    summary:"FSSB optical link disconnected at COP10A port. Replace optical cable farthest from CNC on the unit showing 'L', then the SVM on each side.",
+    context:"SVM code 'L' means the FSSB optical link broke on the COP10A side (slave side / farthest from CNC). The FSSB chain runs CNC → COP10B of first SVM → COP10A of first SVM → COP10B of second SVM → etc. 'L' on a unit means the break is on its COP10A cable — the cable going AWAY from the CNC direction.",
+    steps:[
+      { title:"Identify which SVM shows 'L'",
+        detail:"Find the SVM in the chain displaying 'L'. The break is on the COP10A cable connected to this unit — the cable going toward the slave/far end." },
+      { title:"Replace the COP10A optical cable on the unit showing 'L'",
+        detail:"Replace the fiber optic cable on the COP10A side of the affected SVM. This is the cable going AWAY from the CNC (toward the slave end). Fiber cables can crack internally without visible external damage." },
+      { title:"Replace the SVM farthest from CNC showing 'L'",
+        detail:"If a new cable doesn't fix it, the COP10A port on the affected SVM may be faulty. Replace that SVM." },
+      { title:"Replace the SVM on the other end of the cable",
+        detail:"If the problem persists, the COP10A-side SVM's neighbor (connected via this cable) may have a faulty COP10B port. Replace that unit." },
+      { title:"If the break is nearest the CNC — replace the axis control card",
+        detail:"The manual also lists CNC failure for this alarm. If the 'L' break is on the first link out of the CNC, or all cables and SVMs in the chain have been checked and it persists, the CNC's axis control card (FSSB master) is the remaining suspect. See §2.4 for its location." },
+    ],
+    source:"B-65285EN §3.2.13" },
+  { key:"sv462", codes:["462","463","SV0462","SV0463"], title:"FSSB Data Transfer Failed",
+    desc:"Slave could not receive correct data via FSSB — check COP10A/B cable",
+    type:"SV", severity:"high",
+    summary:"FSSB optical link error at COP10B port (master/CNC side). Replace optical cable nearest to CNC on the unit showing 'U', then the adjacent SVMs, then CNC servo card.",
+    context:"SVM code 'U' means the FSSB link broke on the COP10B side (master side / nearest to CNC). A momentary 'U' blink at power-on followed by steady '-' is normal — not a failure. Only persistent 'U' is an alarm. The troubleshooting order works from the cable toward the CNC.",
+    steps:[
+      { title:"Confirm 'U' is persistent (not just power-on blink)",
+        detail:"When the CNC powers on, 'U' blinks momentarily then changes to '-'. This is normal startup behavior, not a failure. Only persistent 'U' is an alarm." },
+      { title:"Identify which SVM shows 'U'",
+        detail:"Find the SVM displaying 'U'. The break is on the COP10B cable connected to this unit — the cable going TOWARD the CNC." },
+      { title:"Replace the COP10B optical cable nearest to CNC on the unit showing 'U'",
+        detail:"Replace the fiber optic cable on the COP10B side of the affected SVM. This is the cable going toward the CNC (master end)." },
+      { title:"Replace the SVM showing 'U'",
+        detail:"If a new cable doesn't fix it, the COP10B port on the affected SVM may be faulty. Replace that SVM." },
+      { title:"Replace the adjacent SVM toward the CNC",
+        detail:"The SVM one step closer to the CNC connects via this cable's other end (its COP10A port). If that port is faulty, replace that SVM." },
+      { title:"Replace the CNC servo card",
+        detail:"If all cables and SVMs in the chain have been checked/replaced and 'U' persists, the CNC-side servo communication card may be faulty." },
+    ],
+    source:"B-65285EN §3.2.12" },
+  { key:"sv5136", codes:["5136","SV5136"], title:"FSSB: Number of Amps is Small",
+    desc:"The number of amplifiers FSSB recognizes is smaller than the number of controlled axes — one the CNC expects isn't on the chain.",
+    type:"SV", severity:"high",
+    summary:"FSSB counts fewer amplifiers than controlled axes. Usually an amplifier that didn't power up, or one the NC can't see over the FSSB chain.",
+    causes:[
+      "Amplifier didn't power up",
+      "FSSB configuration was wrong",
+      "Optical cable broken or loose",
+      "NC was defective",
+    ],
+    steps:[
+      { title:"Look along the amplifiers — is one not powered up?",
+        detail:"One with no LED and a blank 7-segment hasn't powered up — that unit is the one missing from the count. First make sure it is actually getting its control power, and check its fuse. If the power and fuse are good but it stays dead, remove the unit for repair." },
+      { title:"All powered — open SYSTEM → FSSB to see which one the NC can't see",
+        detail:"With every amplifier lit, go to SYSTEM → FSSB. The screen lists the amplifiers the NC actually recognizes, so the missing one shows you where the chain breaks. The FSSB assignment is rarely touched in the field, but it's worth confirming it still matches the machine — a restore or a swap can leave it expecting an amp that isn't there." },
+      { title:"Chase the FSSB optical cable to the missing unit",
+        detail:"An amplifier that's powered but still not seen has a broken optical link — a loose or damaged COP10A/COP10B fiber drops that unit and everything downstream of it. Reseat the fiber and swap it for a known-good one. If the machine has an SDU (Separate Detector Unit — many people don't realise it), remember it sits in the FSSB chain too; include its fiber connections." },
+      { title:"Amps, fibers and setting all good — then the NC",
+        detail:"With the amplifiers powered, the fibers sound and the FSSB setting matching the machine, the only thing left is the CNC's axis control card (the FSSB master). Remove the NC for repair." },
+    ],
+    source:"B-64115EN §8.24" },
+  { key:"sv466", codes:["466","SV0466"], title:"Motor / Amp Combination Error",
+    desc:"Amplifier maximum current rating does not match the motor",
+    type:"SV", severity:"high",
+    summary:"The motor ID the amplifier reads does not match the amplifier's own current rating. Wrong motor fitted, wrong motor-ID parameter, or an amp too small for the motor. Fires at power-on.",
+    context:"The SVM reads the motor's ID (via P2020) and checks it against its own maximum current rating. If the two don't pair legally — the motor needs more current than the amp can give, or the ID doesn't match the fitted motor — this alarm fires at power-on. It follows a motor or amplifier swap almost every time.",
+    steps:[
+      { title:"Confirm a recent motor or amplifier swap",
+        detail:"466 follows a service action nearly always. Establish which was changed — the motor, the SVM, or the motor-ID parameter — that points straight at the mismatch." },
+      { title:"Check the motor-ID parameter P2020",
+        detail:"SYSTEM → PARAM → 2020 → NO.SRH. P2020 identifies the motor type. If a motor was replaced and P2020 wasn't updated (or was restored from the wrong file), the ID won't match the fitted motor. Set it to the new motor's value." },
+      { title:"Verify the motor model against the amplifier rating",
+        detail:"Read the motor nameplate (A06B-xxxx-Bxxx) and the SVM nameplate. The SVM's current rating must be adequate for that motor. Cross-reference the legal motor/amp pairing in the FANUC Descriptions manual (B-65282EN)." },
+      { title:"If the amp is genuinely too small — fit the right hardware",
+        detail:"If the motor legitimately needs more current than this SVM can supply, no parameter fixes it: install the correct motor for the amp, or upsize the SVM to match the motor. This is a hardware-matching alarm, not a tuning one." },
+      { title:"Motor, amp and P2020 all correct but it persists",
+        detail:"Reseat the SVM faceplate (a poor ID read can look like a mismatch). If it still fires with a confirmed-correct pairing, the amp's ID-read circuit is suspect — swap in a known-good SVM of the correct rating." },
+    ],
+    source:"B-65285EN §3.3.8" },
+
+  // ── SV 600-series (INV / CNV amplifier-detected) ──────────────────────────
+  { key:"sv600", codes:["600","SV0600"], title:"INV DC Link Overcurrent",
+    desc:"DC link current too large in SVM — check motor and power cable",
+    type:"SV", severity:"high",
+    summary:"SVM detected excessive current on the DC link (bus) side. Almost always a hard short between motor lead phases or a ground fault — in the leads or the motor windings — otherwise the SVM power stage. LED shows 8 (L axis), 9 (M axis), or A (N axis).",
+    context:"'8/9/A' is the DC-link-side detection and carries NO decimal point — that is what separates it from '8./9./A.' (IPM alarm, SV0449/SV0603). Because it's a bus-side overcurrent it points at a dead short, so the manual goes straight to a disconnect-and-megger sequence rather than parameters.",
+    steps:[
+      { title:"Confirm the LED reads '8' with no dot",
+        detail:"A plain 8/9/A is DC-link current (this alarm). An 8./9./A. with the decimal point lit is the IPM alarm (SV0449) or IPM-OH (SV0603) — a different card. Check the dot before going further." },
+      { title:"Disconnect the motor power leads and release E-stop",
+        detail:"Pull U/V/W off the amp, release E-stop, and let it initialize. If the alarm STILL fires with the motor disconnected → the SVM power stage (IGBT/IPM) is faulty, replace the SVM. If it clears → the fault is in the motor or cable.",
+        warn:"Confirm the DC link is discharged before touching any power terminals." },
+      { title:"Megger PE to each phase",
+        detail:"With the leads off the amp, megger between PE and each power lead (U, V, W). Degraded insulation confirms a downstream ground fault — move on to split cable from motor." },
+      { title:"Split cable vs motor",
+        detail:"Disconnect the power cable at the motor terminal box. Megger the cable alone (each phase to screen/armour) and the motor alone (each terminal to frame). Whichever reads low is the culprit." },
+      { title:"Replace the motor if its winding insulation failed",
+        detail:"A shorted or ground-faulted winding is often coolant ingress — look for discolouration inside the terminal box. Replace the motor." },
+      { title:"Replace the cable if the cable insulation failed",
+        detail:"Cable breakdown usually happens at flex points in conduit or cable carriers. Replace the power cable." },
+      { title:"Replace the SVM if it alarms with the motor disconnected",
+        detail:"A DC-link current alarm with nothing connected means the amp's own power stage is shorted. Replace the SVM." },
+    ],
+    result:"Motor and cable megger clean and the drive comes out of E-stop without tripping — the DC-link current alarm stays clear.",
+    source:"B-65285EN §3.2.7" },
+  { key:"sv601", codes:["601","SV0601"], title:"INV Radiator Fan Failure",
+    desc:"SVM external cooling fin fan failed — check fan and connector",
+    type:"SV", severity:"high",
+    summary:"SVM external heatsink (radiator) fan stopped. Foreign material, connector, fan motor, or SVM board fault.",
+    context:"SVM code 'F' is the EXTERNAL heatsink fan (the large fan cooling the rear fins). This is different from code '1' (internal stirring fan). Without the radiator fan, the SVM will overheat under load and eventually trigger overheat alarm (code 6). Fans always blow upward.",
+    steps:[
+      { title:"Check for foreign material in the fan",
+        detail:"Look for debris, cable ties, or insulation blocking the fan blades. Even small obstructions can stall the fan." },
+      { title:"Push faceplate (control PCB) fully home",
+        detail:"The fan drive signal comes from the control PCB. If the faceplate is not fully seated, the fan may not receive power." },
+      { title:"Check fan connector",
+        detail:"Verify the fan cable connector is properly attached to the PCB header. Reseat it firmly." },
+      { title:"Replace the fan",
+        detail:"If the fan doesn't spin with clear blades and good connections, replace the fan motor unit." },
+      { title:"Replace the SVM",
+        detail:"If a new fan still doesn't spin, the fan drive circuit on the SVM control PCB has failed. Replace the SVM." },
+    ],
+    source:"B-65285EN §3.2.5" },
+  { key:"sv602", codes:["602","SV0602"], title:"INV Overheat",
+    desc:"Servo amplifier overheated — check ambient temperature and fans",
+    type:"SV", severity:"high",
+    summary:"SVM heatsink temperature abnormally high. Motor overloaded, ambient too hot, cabinet cooling insufficient, or SVM failure.",
+    context:"SVM code '6' is a straightforward overheat — the heatsink temperature sensor exceeded its threshold. Unlike IPM overheat (8./9./A.), this is purely thermal. The most common causes in the field are dirty heatsink fins, failed cabinet cooling, and motors running above continuous rating.",
+    steps:[
+      { title:"Check motor is within continuous rating",
+        detail:"View the load meter and compare against the motor's continuous rating. If the motor consistently runs above its rating, it draws excessive current through the SVM, heating the SVM." },
+      { title:"Check cabinet cooling capacity",
+        detail:"Inspect cabinet fans, air filters, and heat exchangers. Clogged filters or failed cabinet fans reduce airflow and raise internal temperature. Clean or replace as needed." },
+      { title:"Check ambient temperature",
+        detail:"If the shop or cabinet area exceeds the SVM's rated ambient (typically 55°C), the SVM cannot dissipate heat adequately. Lower the ambient or improve ventilation." },
+      { title:"Push faceplate (control PCB) fully home",
+        detail:"A partially seated control PCB can cause a false temperature reading. Push it in firmly until it clicks." },
+      { title:"Replace the SVM",
+        detail:"If cooling is adequate, load is within spec, ambient is normal, and the alarm persists — the temperature sensor or SVM power stage has an internal failure. Replace the SVM." },
+    ],
+    source:"B-65285EN §3.2.4" },
+  { key:"sv603", codes:["603","SV0603"], title:"INV IPM Overheat Alarm",
+    desc:"SVM IPM intelligent power module overheated",
+    type:"SV", severity:"high",
+    summary:"SVM IPM overheat variant (8./9./A. with OH flag). Motor overloaded, ambient too hot, or failed cooling. Same LED code as SV0449 — distinguished by CNC alarm number.",
+    context:"This is the overheat variant of the IPM alarm — same LED display (8./9./A.) as SV0449, but the CNC reports SV0603 instead of SV0449. The IPM's internal temperature sensor tripped. This is distinct from SVM code '6' (heatsink overheat) because the IPM junction temperature exceeded its limit even if the heatsink temperature is acceptable.",
+    steps:[
+      { title:"Push faceplate (control PCB) fully home",
+        detail:"A partially seated control PCB can cause incorrect IPM temperature reading. Push it in until it clicks." },
+      { title:"Check heatsink cooling fan (SVM code F fan)",
+        detail:"Verify the heatsink cooling fan is running. Without it, the IPM junction temperature rises much faster than the heatsink surface temperature." },
+      { title:"Check motor usage is within continuous rating",
+        detail:"Sustained heavy cutting or rapid accel/decel cycles push the IPM beyond its thermal limits. Check load meter and reduce duty cycle if the motor is running above continuous rating." },
+      { title:"Check cabinet cooling and ambient temperature",
+        detail:"Inspect cabinet fans, filters, and heat exchangers. High ambient temperature reduces the IPM's thermal headroom. Clean filters and ensure adequate airflow." },
+      { title:"Replace the SVM",
+        detail:"If cooling is adequate and the motor is within rating, the IPM's thermal characteristics have degraded. Replace the SVM." },
+    ],
+    source:"B-65285EN §3.2.9" },
+  { key:"sv604", codes:["604","SV0604"], title:"Amp Communication Error",
+    desc:"Communication between SVM and PSM failed — check CXA2A/B cable",
+    type:"SV", severity:"high",
+    summary:"Communication error between amplifier modules. CXA2A/B cable/connector fault, or control PCB failure. Both PSM and SVM show code 'P'.",
+    context:"Code 'P' appears on both PSM and SVM — it means the amplifier-to-amplifier communication link has failed. The CXA2A/B connectors daisy-chain all amps together for status exchange and synchronization. A single bad connector in the chain can take down the entire drive system.",
+    steps:[
+      { title:"Check CXA2A/B connectors on all amplifiers",
+        detail:"Inspect every CXA2A and CXA2B connector in the chain from PSM through each SVM and SPM. Look for loose connectors, bent pins, or corroded contacts. Reseat each one firmly." },
+      { title:"Check CXA2A/B cables",
+        detail:"Inspect the flat cables between amplifiers. Look for pinched, cut, or kinked cables. These cables carry the 24VDC power and communication signals — any damage breaks the chain." },
+      { title:"Reseat every amplifier faceplate fully",
+        detail:"On each amp push the faceplate (control PCB) in until it clicks. The inter-amplifier link mates through connectors behind the faceplate — a single half-seated board breaks 'P' communication for the whole chain. Cheap to rule out before isolating." },
+      { title:"Isolate the faulty unit",
+        detail:"Disconnect the CXA2A/B chain one unit at a time. If removing a specific amp from the chain clears the 'P' alarm on the remaining units, that amp's communication circuit is faulty." },
+      { title:"Replace the control PCB or amplifier",
+        detail:"If a specific SVM or PSM is identified as the communication fault source, replace its control PCB (faceplate board) or the entire amplifier." },
+    ],
+    source:"B-65285EN §3.2.6, §3.1.13" },
+  { key:"sv605", codes:["605","SV0605"], title:"CNV Excessive Regenerative Power",
+    desc:"PSMR regenerative power too large — check regenerative resistor spec",
+    type:"SV", severity:"high",
+    summary:"PSMR short-term regenerative power exceeded limit. Insufficient regenerative resistance or internal regenerative circuit failure. αiPSR only.",
+    context:"PSM code '8' only appears on αiPSR units. It differs from code 'H' (resistor overheat) — this is a short-term peak power event, not a thermal accumulation. The regenerative circuit detected more energy in a single braking event than the resistor can safely absorb.",
+    steps:[
+      { title:"Confirm it's code 8, not code H",
+        detail:"Code 8 is a short-term peak — one braking event returned more power than the resistor can take instantly. Code H is thermal accumulation (resistor overheated over time → see SV0440). They read differently on the PSMR faceplate and point at different fixes; make sure you're on 8." },
+      { title:"Review regenerative resistance specification",
+        detail:"Check the regenerative resistor's wattage and ohm rating against the PSMR requirements. An undersized resistor will trip this alarm during heavy braking even if the thermal capacity hasn't been exceeded." },
+      { title:"Check braking duty cycle",
+        detail:"If the machine performs heavy spindle or axis deceleration from high speed, the instantaneous regenerative power may spike beyond the resistor's peak rating. Consider a larger resistor or reducing deceleration rates." },
+      { title:"Check regenerative resistor wiring",
+        detail:"Verify the resistor is properly connected. An open or high-resistance connection means no energy can be absorbed, causing immediate alarm on any regenerative event." },
+      { title:"Replace the PSMR",
+        detail:"If the resistor is correctly specified and properly wired, the PSMR's internal regenerative switching circuit may be faulty. Replace the PSMR." },
+    ],
+    source:"B-65285EN §3.1.9" },
+  { key:"sv606", codes:["606","SV0606"], title:"CNV Radiator Fan Failure",
+    desc:"PSM external cooling fin fan failed — check fan and connector",
+    type:"SV", severity:"high",
+    summary:"PSM external dissipator cooling fan stopped, or internal stirring fan stopped (older PSM models). Fan failure, loose control PCB, or PCB connector issue.",
+    context:"PSM code 'A' covers the external radiator fin fan on most PSMs. On older models (A06B-6110-HXXX, A06B-6120-HXXX), it also covers the internal unit stirring fan. This is different from code '2' which is the control circuit fan.",
+    steps:[
+      { title:"Check external radiator cooling fan",
+        detail:"Look at the large fan on the PSM heatsink. Is it spinning? Fans always blow upward. Check for obstructions, debris, or foreign material in the blades." },
+      { title:"Check internal stirring fan (older PSM models only)",
+        detail:"On A06B-6110 and A06B-6120 series PSMs, this alarm also covers the internal stirring fan. Open the unit and verify the small internal fan spins." },
+      { title:"Push faceplate (control PCB) fully home",
+        detail:"The fan monitoring signal goes through the control PCB. If the faceplate is not fully seated, the PSM can't detect the fan. A partially detached connector between control and power PCBs can also trigger this alarm." },
+      { title:"Replace the fan",
+        detail:"If the fan is confirmed stopped with clear blades and good PCB connection, the fan motor has failed. Replace with the correct FANUC fan." },
+      { title:"Replace the PSM control PCB",
+        detail:"If a new fan still triggers the alarm, the fan monitoring circuit on the control PCB has failed. Replace the control PCB or the entire PSM." },
+    ],
+    source:"B-65285EN §3.1.10" },
+  { key:"sv607", codes:["607","SV0607"], title:"CNV Single Phase Failure",
+    desc:"Converter (PS) input open phase, PS code E — one input phase missing",
+    type:"SV", severity:"high",
+    summary:"The converter (PS) sees only two of three input phases — PS code E.",
+    context:"Almost always external — a phase lost upstream. The PS can't run single-phase. Find the missing phase first; only if all three are good at the PS input does the PS itself come into question.",
+    steps:[
+      { title:"Measure all three phases at the PS input",
+        detail:"Check R-S, S-T, T-R at the PS input terminals. One pair reads low or zero — that's the lost phase, and it tells you which one to chase." },
+      { title:"Trace the missing phase upstream",
+        detail:"Follow the dead phase back through the terminal blocks, contactor, and breaker to the supply. Loose lug, blown fuse, or a tripped/pitted breaker pole is the usual find." },
+      { title:"Check the input fuse and the contactor pole for that phase",
+        detail:"Zero in on the dead phase: check its input fuse for continuity, and check that the main contactor (MCC) pole for that phase actually closes and passes voltage. A single blown fuse or a pitted/welded-open contactor pole is the classic open-phase cause." },
+      { title:"Intermittent? Monitor the supply",
+        detail:"If it comes and goes, put a recording meter on all three phases over time. Plants with heavy machinery can drop a phase at peak demand." },
+      { title:"All three phases good but it still alarms — it's the PS",
+        detail:"Balanced three-phase confirmed at the PS input and it still trips E → the PS phase-detection is faulty. Bring it to the lab for repair, or swap in a working unit." },
+    ],
+    source:"B-65285EN §3.1.11" },
+  { key:"sv654", codes:["654","SV0654"], title:"DB Relay Error",
+    desc:"Dynamic brake relay fault detected — check relay contacts or replace SVM",
+    type:"SV", severity:"high",
+    summary:"SVM dynamic brake relay contact check failed. Power lead short-circuit or SVM internal relay/detection circuit failure.",
+    context:"The dynamic brake relay inside the SVM engages when the servo is in E-stop to short the motor phases and stop rotation. SV0654 fires when the SVM's self-check detects the relay contacts are not in the expected state — either stuck closed when they should be open, or stuck open when they should be closed.",
+    steps:[
+      { title:"Note when it fires — it's a relay self-check",
+        detail:"The SVM checks its dynamic-brake relay state at E-stop / power-on. 654 means the contacts weren't where they should be — stuck closed when they should open, or open when they should close. It's a self-check result, so work the relay path, not the motion." },
+      { title:"Check for motor power lead short-circuit",
+        detail:"Check the motor power leads (U, V, W) for short-circuit between phases or to ground. A shorted power lead can hold the DB relay in the wrong state and fail the check.",
+        warn:"Confirm the DC link is discharged before touching any power terminals." },
+      { title:"Cycle power and retest",
+        detail:"Turn off CNC, wait 30 seconds, power back on. If the alarm clears, it may have been a transient relay contact issue. Monitor for recurrence." },
+      { title:"If a separate Dynamic Brake Module (DBM) is fitted — check its path",
+        detail:"Large axes use an external DBM instead of the SVM's internal relay. Check the SV-to-DBM connection and the CX1A/CX1B interlock cabling between PS and SV, and the DBM fuse, before condemning the amplifier." },
+      { title:"Replace the SVM (or DBM)",
+        detail:"If the power leads are clean, the DBM path (if any) is good, and the alarm persists, the DB relay or its detection circuit has failed. It is not field-repairable — replace the SVM, or the DBM on axes that use one." },
+    ],
+    source:"B-65285EN §3.2.14" },
+
+  // ── OH ALARMS ─────────────────────────────────────────────────────────────
+  { key:"oh700", codes:["700","OH0700"], title:"CNC Control Unit Overheat",
+    desc:"CNC control unit overheated — check fan and clean air filter",
+    type:"OH", severity:"high",
+    summary:"CNC main unit internal temperature exceeded limit. Fan stopped, filter clogged, or high ambient.",
+    context:"The CNC control unit has an internal temperature sensor. When it exceeds the threshold, this alarm fires. The most common cause in the field is a clogged air filter on the CNC unit — these should be cleaned monthly.",
+    steps:[
+      { title:"Check and clean the air filter on the CNC unit",
+        detail:"The CNC control unit has an air intake filter (usually on the front or bottom). Remove it and clean with compressed air or wash with water and dry. A clogged filter is the most common cause." },
+      { title:"Check the CNC cooling fan",
+        detail:"Verify the fan on the CNC unit is running. Listen for it at power-on. If stopped, check its connector. If the fan motor has failed, replace it." },
+      { title:"Check ambient temperature",
+        detail:"If the control cabinet temperature exceeds specification (typically 55°C), the CNC cannot cool itself. Check cabinet fans, heat exchanger, and air conditioning if equipped." },
+      { title:"Reduce heat load in the cabinet",
+        detail:"Too many heat-generating devices in a small cabinet raises ambient. Consider adding a cabinet cooler or relocating heat sources." },
+      { title:"If the unit is not actually hot — suspect the sensor/board",
+        detail:"Feel the control unit. If it's cool but still alarms overheat, the internal temperature sensor or its circuit on the main board is giving a false reading. Rule out filter/fan/ambient first; a false overheat on a cool unit points at the board." },
+    ],
+    source:"B-64115EN §5.3, §8.18" },
+  { key:"oh701", codes:["701","OH0701"], title:"CNC Fan Motor Overheat",
+    desc:"Cabinet fan motor on top of CNC overheated — replace fan",
+    type:"OH", severity:"high",
+    summary:"The fan motor mounted on top of the CNC control unit has overheated. Fan motor bearing failure or obstruction.",
+    context:"This alarm indicates the fan motor itself is overheating — not the CNC unit. The fan motor has a thermal protection device. Causes: bearing wear, blocked airflow, or foreign material in the fan.",
+    steps:[
+      { title:"Confirm it's the fan motor, not the control unit (700)",
+        detail:"701 is the fan motor on top of the CNC overheating itself, not the CNC unit (that's 700). The fan motor has its own thermal protector — this alarm means that tripped." },
+      { title:"Check for obstructions in the fan",
+        detail:"Look for debris, cable ties, insulation, or anything blocking the fan blades. Even partial obstruction increases fan motor load and temperature." },
+      { title:"Check fan rotation — is it sluggish?",
+        detail:"At power-on, listen to the fan. A fan with worn bearings will sound rough or may spin slowly. Compare with a healthy fan if possible." },
+      { title:"Check the fan power and connector",
+        detail:"Verify the fan is getting its supply and its connector is firmly seated. A marginal supply or loose connector makes the motor labour and heat up." },
+      { title:"Replace the fan motor",
+        detail:"If the fan has worn bearings, labours, or overheats repeatedly, replace the entire fan unit with the correct FANUC part." },
+    ],
+    source:"B-64115EN §5.3, §8.19" },
+  { key:"oh704", codes:["704","OH0704"], title:"Spindle Overheat",
+    desc:"Spindle overheated during fluctuation detection — check cutting load",
+    type:"OH", severity:"high",
+    summary:"Spindle motor temperature sensor detected overheating. Excessive cutting load, cooling failure, or sensor fault.",
+    context:"The spindle motor has an internal temperature sensor (thermistor). When temperature exceeds the limit, this alarm fires through the SPM to the CNC. Similar troubleshooting to SPM alarm 01 but reported via CNC alarm system.",
+    steps:[
+      { title:"Check if spindle motor is actually hot",
+        detail:"Feel the motor housing carefully. If genuinely hot, the motor was thermally overloaded — continue to step 2. If cool, skip to step 4." },
+      { title:"Check spindle motor cooling",
+        detail:"Fan-cooled spindles: verify the cooling fan is running. Liquid-cooled spindles: check coolant flow, pump operation, and coolant temperature. A stopped fan or no coolant flow causes rapid overheating." },
+      { title:"Relieve the cutting load",
+        detail:"The manual's first remedy: if the cutting load is heavy, ease the cutting condition (depth, feed, speed). 704 fires via spindle speed-fluctuation detection, so a load that drags the spindle down is a direct trigger. Add cool-down pauses if the duty cycle is high." },
+      { title:"Check the cutting tool is sharp",
+        detail:"Manual remedy 2: a dull or worn tool forces the spindle to work far harder for the same cut, overheating it. Inspect and change the tool if it's not sharp." },
+      { title:"If motor is NOT hot — sensor circuit or spindle amp",
+        detail:"Check the feedback cable connector at the motor for coolant ingress, and the SPM motor parameters (B-65280EN). If the temperature reads abnormal while the motor is cool, the thermistor/cable is faulty. The manual also lists a faulty spindle amplifier (SPM) as a possible cause — suspect it if sensor and cooling check out." },
+    ],
+    source:"B-65285EN §3.3.5, B-64115EN §5.3, §8.20" },
+
+  // ── SP ALARMS (CNC-side spindle) ──────────────────────────────────────────
+  { key:"sp749", codes:["749","SP9749"], title:"Serial Spindle LSI Error",
+    desc:"Serial communication error on CNC-spindle optical link at startup",
+    type:"SP", severity:"high",
+    summary:"Serial-spindle communication error while the system runs after power-on. SPM shows A1. Manual causes: optical cable, CNC MAIN CPU / option-2 board, SPM control PCB, or an abnormal SPM (A/A1/A2).",
+    context:"The CNC talks to the spindle amplifier (SPM) over a serial optical link. B-64115EN lists four causes for 749: the optical cable is faulty/not connected/cut; the CNC MAIN CPU board or option-2 board is faulty; the SPM printed board is faulty; or the SPM itself is abnormal (its 7-seg shows A, A1, A2…). The SPM indication tied to 749 is A1 — an abnormality in the CPU peripheral circuit of the SPM control circuit.",
+    steps:[
+      { title:"Check the spindle optical cable",
+        detail:"Inspect the fiber optic cable between the CNC and the SPM. Check both connectors for dirt, damage, or loose seating; confirm it's actually connected and not cut. Clean connector faces with dry compressed air." },
+      { title:"Power cycle the CNC",
+        detail:"Turn off all power, wait 30 seconds, power on. A startup timing glitch can trip this once and clear on retry." },
+      { title:"Read the SPM 7-segment display",
+        detail:"If the SPM shows A1 (or A/A2), the fault is on the SPM side — its control-circuit CPU peripheral. Any SPM alarm code must be resolved before the link can establish." },
+      { title:"Replace the optical cable, then the SPM control PCB",
+        detail:"Work in order of likelihood: (1) optical cable, (2) SPM control PCB or the whole SPM (the A1 indication points here)." },
+      { title:"Replace the CNC-side board",
+        detail:"If the cable and SPM are good, the CNC side is the remaining cause — the MAIN CPU board or the option-2 (serial spindle) board. Replace per §2.4 locations." },
+    ],
+    source:"B-64115EN §5.5, §8.21" },
+  { key:"sp750", codes:["750","SP9750"], title:"Spindle Serial Link Start Fault",
+    desc:"Spindle control unit not ready at startup — check SPM and optical cable",
+    type:"SP", severity:"high",
+    summary:"The spindle serial link failed to start — the SPM program didn't start normally. SPM shows A0 (or A). Manual cause: ROM series error or hardware fault on the SPM control PCB; remedy is to replace the ROM, then the control PCB. Control power / optical cable can also block startup.",
+    context:"At power-on the CNC waits for the SPM to start its program and report ready. B-64115EN ties 750 to the SPM showing A0/A — 'the program does not start normally', a ROM series error or hardware abnormality on the SPM control PCB, fixed by replacing the ROM then the control PCB. Before that, rule out the practical blockers: no control power or a dead optical link also stop the link starting.",
+    steps:[
+      { title:"Read the SPM 7-segment — is it A0 / A?",
+        detail:"A0 or A means the SPM program didn't start — a ROM-series or control-PCB hardware fault on the SPM. That's the manual's headline cause and points straight at the SPM control PCB." },
+      { title:"Check SPM control power",
+        detail:"The SPM needs 24VDC control power (from the PSM via CXA2A/B). Check the SPM PIL LED — if dark, it has no control power; work the PSM and CXA2A/B chain first, since a dead SPM can't start its link either." },
+      { title:"Check the spindle optical cable",
+        detail:"Inspect the fiber optic cable from CNC to SPM. Reseat both connectors; replace the cable if damaged. A dead link stops startup regardless of the SPM." },
+      { title:"Replace the ROM on the SPM control PCB",
+        detail:"Manual remedy 1: if the SPM shows A0/A with power and cable good, replace the ROM (software) on the SPM control printed-circuit board and retry." },
+      { title:"Replace the SPM control PCB",
+        detail:"Manual remedy 2: if a ROM change doesn't start the program, replace the SPM control printed-circuit board (or the whole SPM)." },
+    ],
+    source:"B-64115EN §5.5, §8.22" },
+  { key:"sp752", codes:["752","762","772","782","SP9752"], title:"Spindle Mode Change Fault",
+    desc:"Spindle didn't complete a mode change (Cs / positioning / rigid tap / spindle control). 1st spindle = 752; 2nd/3rd/4th = 762/772/782",
+    type:"SP", severity:"high",
+    summary:"The spindle control unit did not respond correctly to a mode-change command from the NC. The modes involved are Cs contouring, spindle positioning, rigid tapping, and spindle (speed) control. 1st spindle shows 752; the 2nd/3rd/4th spindles show 762/772/782 (same fault).",
+    context:"B-64115EN: 752 is generated when the system does not properly terminate a mode change — the SP unit didn't answer the NC's mode-change command correctly. The change needs the spindle to decelerate, lock/orient, and report ready; if any step doesn't complete, it trips. The manual gives no parameter numbers here, so verify any mode-change/orientation settings in the αi Spindle Parameter Manual (B-65280EN) rather than guessing.",
+    steps:[
+      { title:"Which mode change was commanded?",
+        detail:"Identify what the NC asked for — Cs contour, spindle positioning, rigid tapping, or back to spindle (speed) control. 752 means the SP didn't complete that transition, so the failing transition points at the cause." },
+      { title:"Was the spindle still turning too fast?",
+        detail:"A mode change needs the spindle decelerated first. If the program didn't command a speed-down before M19 / rigid tap / Cs, the spindle can't lock in time. Check the program sequence." },
+      { title:"Orientation (M19) — check the orient hardware",
+        detail:"For orientation, verify the orientation sensor / position coder and any dog are working and aligned. A failed or misaligned orient sensor stops the mode change from completing." },
+      { title:"Check the mode-change / sensor parameters (B-65280EN)",
+        detail:"Confirm the spindle mode-change and position-sensor parameters against the αi Spindle Parameter Manual (B-65280EN) for this machine — a restore from the wrong file or an SPM swap can leave them inconsistent. Don't change values by guess." },
+      { title:"Check for mechanical resistance on the spindle",
+        detail:"If the spindle can't decelerate or lock smoothly (bearing damage, belt tension, brake not releasing), the change times out. Turn it by hand with power off and listen for noise." },
+      { title:"Read the SPM display for a related fault",
+        detail:"Check the SPM 7-segment and the CNC diagnosis for any accompanying spindle alarm — it often pinpoints why the SP couldn't answer the mode-change command." },
+    ],
+    source:"B-64115EN §5.5, App.A" },
+  { key:"sp754", codes:["754","764","774","784","SP9754"], title:"Spindle Abnormal Torque",
+    desc:"Abnormal spindle motor load detected. 1st spindle = 754; 2nd/3rd/4th = 764/774/784",
+    type:"SP", severity:"high",
+    summary:"The spindle motor's load/torque exceeded the abnormal-load detection level. The spindle equivalent of the servo torque alarm — collision, mechanical bind, or a detection level set too tight. 1st spindle = 754; 2nd/3rd/4th = 764/774/784.",
+    context:"B-64115EN: abnormal spindle motor load detected. Triage by when it fired — a real collision/overload mid-cut, or a light-load/standstill trip pointing at the load-detection setup. The manual gives no parameter number for 754, so verify any load-detection setting against the αi Spindle Parameter Manual (B-65280EN) rather than guessing.",
+    steps:[
+      { title:"When did it fire — under load, or light/standstill?",
+        detail:"Mid-cut or on a hard move → suspect a real overload or collision (next steps). At light load or standstill → suspect the abnormal-load detection level being set too tight." },
+      { title:"Check for collision or tool jamming",
+        detail:"Was the spindle cutting when it fired? Look for tool breakage, workpiece collision, or chip packing that stalled the spindle." },
+      { title:"Turn the spindle by hand (power off)",
+        detail:"Power off. Rotate the spindle by hand. Locked or very stiff → bearing seizure, gear damage, or a brake not releasing." },
+      { title:"Check the load-detection / motor parameters (B-65280EN)",
+        detail:"Verify the spindle load-detection setup and motor parameters against the αi Spindle Parameter Manual (B-65280EN). A too-tight level, or wrong values after a param restore or SPM/motor swap, cause false trips — confirm against the machine-builder set." },
+      { title:"Read the SPM display for a related code",
+        detail:"Check the SPM 7-segment for an accompanying code that details the torque/load fault condition." },
+    ],
+    source:"B-64115EN §5.5, App.A" },
+
+  // ── SP9xxx ALARMS (CNC screen spindle alarms — map to SPM 7-seg codes) ────
+  { key:"sp9001", codes:["9001","SP9001"], title:"Spindle Motor Overheat",
+    desc:"Motor thermostat tripped — overload, cooling failure, or sensor fault",
+    type:"SP", severity:"high",
+    summary:"Thermostat embedded in the spindle motor winding has tripped. Internal motor temperature exceeds the specified level. SPM shows '01'.",
+    context:"This alarm fires when the spindle motor's built-in thermostat detects excessive winding temperature. Common during heavy continuous cutting, failed cooling fan/coolant system, or — if the motor is cool — a faulty temperature sensor or feedback cable with coolant ingress.",
+    steps:[
+      { title:"Check if motor is actually hot",
+        detail:"Feel the motor housing carefully. If hot → genuine thermal overload, continue to step 2. If cool → skip to step 5 (sensor fault)." },
+      { title:"Check motor cooling system",
+        detail:"Fan-cooled: verify the fan spins freely and runs. Liquid-cooled: check coolant flow, pump operation, and coolant temperature. A seized fan is the #1 cause." },
+      { title:"Review cutting conditions",
+        detail:"Heavy continuous cuts or frequent accel/decel at high torque will overheat the motor. Reduce load or add cool-down pauses between cycles." },
+      { title:"Check motor-specific parameters (B-65280EN)",
+        detail:"Verify OVC (overload current) parameters match the actual motor model. Incorrect values after SPM or motor swap cause premature alarm." },
+      { title:"If motor is cool — check sensor and feedback cable",
+        detail:"Temperature sensor signal travels through the feedback cable. Inspect connector for coolant contamination. Replace feedback cable first; if alarm persists, motor sensor is faulty.",
+        note:"Coolant ingress into the feedback connector is extremely common on liquid-cooled spindles." },
+    ],
+    source:"B-65285EN §3.4.1, B-64115EN App.A" },
+
+  { key:"sp9002", codes:["9002","SP9002"], title:"Excessive Speed Deviation",
+    desc:"Spindle motor speed cannot follow command — overload or parameter fault",
+    type:"SP", severity:"high",
+    summary:"Motor speed deviates too far from the commanded speed during acceleration or heavy load. SPM shows '02'.",
+    context:"The SPM detected that the actual spindle speed cannot keep up with the commanded speed. This can be a genuine overload (tool crash, bearing seizure) or a parameter/tuning issue (acceleration time too short for the machine's inertia).",
+    steps:[
+      { title:"Check if alarm occurs during acceleration",
+        detail:"If the alarm fires only during accel/decel, increase parameter 4082 (acceleration time constant). The spindle may not have enough time to reach speed with the current inertia." },
+      { title:"Check for mechanical overload",
+        detail:"Was the spindle cutting when the alarm fired? Check for tool breakage, chip packing, or bearing resistance that prevents the motor from reaching speed." },
+      { title:"Check motor-specific parameters (B-65280EN)",
+        detail:"Verify parameters match the motor model. Wrong motor type, gain, or speed range settings cause speed deviation detection to trigger falsely." },
+      { title:"Check SPM power supply",
+        detail:"Low DC link voltage (weak PSM, input voltage sag) reduces the SPM's ability to drive the motor to speed. Check PSM display for related alarms." },
+      { title:"Replace SPM if parameters and mechanics are OK",
+        detail:"If all parameters are correct and no mechanical issue exists, the SPM's speed control circuit may be faulty." },
+    ],
+    source:"B-65285EN §3.4.2, B-64115EN App.A" },
+
+  { key:"sp9003", codes:["9003","SP9003"], title:"DC Link Fuse Blown",
+    desc:"Internal SPM fuse blown — check motor insulation before replacing SPM",
+    type:"SP", severity:"critical",
+    summary:"The DC link fuse inside the SPM has blown. PSM reaches ready (shows '00') but DC link voltage is too low at the SPM. SPM shows '03'.",
+    context:"The SPM's internal DC link fuse protects the power stage (IGBT/IPM). It blows when a power device fails internally, or when external wiring (motor leads, JX1A/JX1B bus cable) shorts to ground. Always check external wiring before replacing the SPM — a shorted motor will blow the fuse again immediately.",
+    steps:[
+      { title:"Confirm the signature — PSM ready (00) but SPM 03",
+        detail:"The tell for a blown SPM DC-link fuse is the PSM reaching ready ('00') while the SPM reports low DC link (03). That places the fault at the SPM and its motor/bus side, not the converter — don't chase the PSM." },
+      { title:"Check motor power leads for short-circuit",
+        detail:"Before touching the SPM, disconnect the motor leads (U/V/W) at the SPM. Check between phases and each phase to ground with a multimeter. Any continuity = short.",
+        warn:"Confirm DC link is fully discharged before touching any power terminals." },
+      { title:"Megger test the motor",
+        detail:"Disconnect motor from power leads. Megger each winding to frame ground at 500V. Below 10 MΩ = motor insulation failed — do NOT install new SPM until motor is replaced.",
+        note:"Use 1000V megger for HV (400V input) systems." },
+      { title:"Check JX1A/JX1B DC bus connection cable",
+        detail:"Inspect the DC link bus cables between PSM and SPM. Look for damaged insulation, loose terminals, or signs of arcing." },
+      { title:"Replace the SPM",
+        detail:"After confirming motor, leads, and bus cables are clean, replace the SPM. The internal fuse is not field-replaceable." },
+    ],
+    source:"B-65285EN §3.4.3, B-64115EN App.A" },
+
+  { key:"sp9006", codes:["9006","SP9006"], title:"Temperature Sensor Disconnected",
+    desc:"Motor temperature sensor open — feedback cable or sensor fault",
+    type:"SP", severity:"med",
+    summary:"The spindle motor's temperature sensor signal is absent. SPM shows '06'.",
+    context:"The temperature sensor (thermistor) signal travels through the feedback cable from the motor to the SPM. An open circuit in the sensor, a damaged cable, or coolant contamination at the connector will trigger this alarm.",
+    steps:[
+      { title:"Know what 06 is — sensor OPEN, not a real overheat",
+        detail:"Code 06 means the temperature-sensor signal is absent (open circuit), not that the motor is hot (that's 01). So work the sensor/cable path, not cooling. The manual's two remedies are: correct the parameter, and replace the feedback cable." },
+      { title:"Check feedback cable connectors",
+        detail:"Inspect both ends (motor side and SPM side) for bent pins, corrosion, or coolant contamination. Clean and dry connectors thoroughly." },
+      { title:"Check motor-specific parameters",
+        detail:"Verify the temperature sensor type parameter matches the actual motor model. Wrong sensor type setting = wrong expectations for the signal.",
+        note:"Parameter mismatch after motor or SPM swap is a common cause." },
+      { title:"Check sensor wiring continuity",
+        detail:"Measure the thermistor resistance at the feedback cable connector (SPM end, disconnected). A cold motor should read a few hundred ohms to a few kΩ depending on type. Open circuit = sensor or cable failed." },
+      { title:"Replace feedback cable, then motor sensor",
+        detail:"Replace cable first (most likely). If alarm persists with new cable, the thermistor inside the motor has failed." },
+    ],
+    source:"B-65285EN §3.4.4, B-64115EN App.A" },
+
+  { key:"sp9007", codes:["9007","SP9007"], title:"Spindle Overspeed",
+    desc:"Motor speed exceeded 115% of maximum — check sequence or parameters",
+    type:"SP", severity:"high",
+    summary:"Spindle motor speed exceeded 115% of the maximum allowable speed. SPM shows '07'.",
+    context:"The SPM's overspeed detection tripped. This can be caused by a sequence error (spindle synchronization commanded when the spindle can't turn), incorrect max speed parameter, or a runaway speed control fault in the SPM.",
+    steps:[
+      { title:"Check if alarm occurs during sync or thread cutting",
+        detail:"During spindle synchronization, a timing glitch or sequence error (SFR/SRV turned off during sync) can cause brief overspeed. Check the program and ladder for synchronization logic." },
+      { title:"Check maximum speed parameter (P4020)",
+        detail:"Verify parameter 4020 is set to the correct maximum speed for this motor. If set too low, normal high-speed operation triggers the alarm." },
+      { title:"Check gear ratio parameters",
+        detail:"If the spindle uses a gear or belt drive, incorrect gear ratio parameters (P4056-4059) cause the SPM to miscalculate actual speed." },
+      { title:"Position-control mode — check accumulated deviation",
+        detail:"The manual notes a specific trigger: in position-control mode (Cs / rigid tap / orientation), if SFR/SRV is turned off during spindle synchronization, positional deviation piles up and the motor lunges to catch up — reading as overspeed. Fix the sequence so excitation drops only after sync is released." },
+      { title:"Replace SPM if speed detection is faulty",
+        detail:"If parameters are correct and no sync issue exists, the SPM's speed feedback circuit may be faulty." },
+    ],
+    source:"B-65285EN §3.4.5, B-64115EN App.A" },
+
+  { key:"sp9009", codes:["9009","SP9009"], title:"SPM Main Circuit Overheat",
+    desc:"SPM heatsink / IPM temperature abnormal — check cooling",
+    type:"SP", severity:"high",
+    summary:"The power transistor heatsink (radiator) temperature inside the SPM has exceeded the threshold. SPM shows '09'.",
+    context:"The SPM's internal temperature sensor detected excessive heat at the power stage. Most commonly caused by a clogged heatsink, failed cooling fan, or sustained heavy spindle load in a hot cabinet.",
+    steps:[
+      { title:"Check SPM heatsink cooling fan",
+        detail:"Verify the fan is running. If stopped, check for debris blocking the blades, then check the fan connector. Replace fan if the motor has failed." },
+      { title:"Clean the heatsink fins",
+        detail:"Use vacuum or dry compressed air to remove dust from the heatsink. Accumulated dust is the #1 cause of this alarm." },
+      { title:"Check cutting conditions and ambient temperature",
+        detail:"Heavy continuous spindle load or high cabinet temperature (above 45°C) causes overheat. Improve cabinet ventilation or add cooling." },
+      { title:"Push faceplate fully home",
+        detail:"A partially seated SPM control PCB (faceplate) can cause poor thermal contact and false temperature readings. Press until it clicks." },
+      { title:"Replace SPM if all checks pass",
+        detail:"If fan runs, heatsink is clean, load is normal, and ambient is OK — the internal temperature sensor or power stage has failed. Replace SPM." },
+    ],
+    source:"B-65285EN §3.4.6, B-64115EN App.A" },
+
+  { key:"sp9010", codes:["9010","SP9010"], title:"Low Power Supply Input Voltage",
+    desc:"Input voltage to spindle drive system is below minimum — check supply",
+    type:"SP", severity:"high",
+    summary:"The input power supply voltage to the SPM/PSM is below the minimum threshold. SPM shows '10'.",
+    context:"The spindle drive system requires stable input voltage (200–230VAC for 200V class, 380–480VAC for 400V class). Low voltage causes the DC link to sag, and the SPM cannot drive the motor properly. Can also appear during heavy load if the factory power is marginal.",
+    steps:[
+      { title:"Measure input voltage at the PSM terminals",
+        detail:"With the machine under load, measure AC voltage at the PSM power input terminals. Compare against the PSM specification. Voltage sag under load is the most common cause." },
+      { title:"Check factory power supply and transformer",
+        detail:"If voltage is low, the factory supply may be undersized or the transformer tap is set wrong. Check the transformer taps and correct for the actual supply voltage." },
+      { title:"Check for loose or corroded power connections",
+        detail:"High-resistance connections at the breaker, contactor, or terminal block cause voltage drop under load. Tighten all power connections and check for burned terminals." },
+      { title:"Check PSM input fuses and main contactor",
+        detail:"A blown input fuse or partially-open contactor contact drops the voltage to the PSM. Check all three phases." },
+      { title:"Always low, or only under load?",
+        detail:"Low at all times → a wrong transformer tap, undersized supply, or a bad connection. Low only under heavy cutting / multi-axis moves → the supply is marginal for the demand; put a recording meter on the input. If other amps report low voltage at the same time, the fault is upstream (supply/PSM), not this SPM." },
+    ],
+    source:"B-65285EN §3.4.7, B-64115EN App.A" },
+
+  { key:"sp9011", codes:["9011","SP9011"], title:"Converter DC Link Overvoltage",
+    desc:"DC link voltage exceeded limit — regenerative energy or PSM fault",
+    type:"SP", severity:"high",
+    summary:"The PSM detected DC link overvoltage (PSM shows '7'). SPM shows '11'. Excessive regenerative energy during spindle deceleration, or PSM/regen resistor fault.",
+    context:"When the spindle decelerates, the motor acts as a generator and pumps energy back into the DC link. If the regenerative discharge path can't absorb it fast enough, the DC link voltage rises above the trip threshold. This is the same PS code 7 overvoltage as the servo-side SV0439 — one converter fault, reported on both.",
+    steps:[
+      { title:"Trips on hard spindle decel? Confirm PSM shows 7",
+        detail:"If it fires on heavy spindle deceleration, it's the regen-energy path. Read the PSM/αiPS faceplate — it should show 7 at the same time. Trips on E-stop/power-off instead → check the power-off sequence (MCC must stay closed until the spindle stops)." },
+      { title:"Check input power voltage",
+        detail:"Measure the AC input voltage. If it exceeds 253VAC (200V class) or 530VAC (400V class), the DC link baseline is already too high. Correct the transformer tap." },
+      { title:"Check regenerative discharge resistor",
+        detail:"The regen resistor absorbs deceleration energy. If it is open-circuit or its relay/contactor does not close, the DC link overvoltage trips. Check the resistor and its switching circuit." },
+      { title:"Check if PSM is undersized",
+        detail:"If the PSM maximum output specification is exceeded by the total connected spindle load, it cannot absorb regenerative energy. Verify PSM selection against total system power." },
+      { title:"Replace PSM if resistor and voltage are OK",
+        detail:"If the regen circuit is functional and input voltage is within spec, the PSM's overvoltage detection circuit may be faulty." },
+    ],
+    source:"B-65285EN §3.1.8 (PS code 7), B-64115EN App.A" },
+
+  { key:"sp9012", codes:["9012","SP9012"], title:"DC Link Overcurrent / IPM Alarm",
+    desc:"Motor output current abnormally high or IPM fault — check insulation and parameters",
+    type:"SP", severity:"critical",
+    summary:"The motor output current is abnormally high, or the IPM (power module) has detected an internal fault. SPM shows '12'.",
+    context:"This alarm fires when excessive current flows into the main-circuit DC link, or (on αiSP2.2–15 / 5.5HV–15HV) the IPM reports overcurrent. Common causes: a motor power-lead short, motor insulation breakdown, wrong motor parameters, or a destroyed power element. Triage by WHEN it fired — right after a rotation command (short/insulation) vs during rotation (heatsink/cooling/power element).",
+    steps:[
+      { title:"Reseat the control PCB (faceplate) fully",
+        detail:"A half-seated faceplate, or a detached connector between the control and power PCB, can raise this alarm. Push it fully home first." },
+      { title:"When did it fire — at the rotation command or during rotation?",
+        detail:"Right after a rotation command → suspect a short / insulation fault (next two steps). During steady rotation → suspect heatsink/cooling and a degrading power element (step 5)." },
+      { title:"Check motor power leads and megger the motor",
+        detail:"Disconnect the U/V/W leads at the SPM. Check phase-to-phase and phase-to-ground for shorts; then megger each winding to frame at 500V (1000V on HV systems). Below 10 MΩ = insulation failure — replace the motor before re-powering.",
+        warn:"Confirm the DC link is fully discharged before disconnecting motor leads." },
+      { title:"Check motor-specific parameters (B-65280EN)",
+        detail:"Verify the spindle motor parameters match the installed motor. A mismatch after a motor or SPM swap makes the drive demand excess current." },
+      { title:"If it fired during rotation — check the heatsink/cooling",
+        detail:"A dirty heatsink or unmet cooling condition can destroy a power element over time. Clean the heatsink, keep coolant off it, and confirm the cooling fan runs." },
+      { title:"Replace the SPM",
+        detail:"If leads, motor, parameters and cooling are all good, a power element (IGBT/IPM) or the current-detection circuit in the SPM has failed. Replace the SPM." },
+    ],
+    source:"B-65285EN §3.4.8, B-64115EN App.A" },
+
+  { key:"sp9014", codes:["9014","SP9014"], title:"Spindle Amplifier ID Not Registered",
+    desc:"SPM amplifier ID data is missing — new or replaced SPM needs ID write",
+    type:"SP", severity:"med",
+    summary:"The SPM does not have its amplifier ID data registered. SPM shows '14'.",
+    context:"Every SPM stores an amplifier ID that identifies its model and specifications. A new SPM or one that has had its control PCB replaced will not have this ID registered. The CNC cannot configure the drive without it.",
+    steps:[
+      { title:"Expected after an SPM or control-PCB swap",
+        detail:"This alarm is normal on a new SPM or a replaced control PCB — the unit has no amplifier ID yet, so the CNC can't configure the drive. Confirm a swap preceded it." },
+      { title:"Write the amplifier ID from the CNC",
+        detail:"Use the CNC's amplifier ID write function (SYSTEM → SP.AMP → ID WRITE, or equivalent for your generation) and select the correct SPM model from the list." },
+      { title:"Verify the model selected matches the SPM nameplate",
+        detail:"Cross-check the model you wrote against the SPM's A06B- nameplate. Writing the wrong model registers an ID but mis-configures the drive." },
+      { title:"If the ID write fails — reseat the faceplate and retry",
+        detail:"Power off, push the SPM faceplate fully home so its connectors mate, power on, and retry the write. A poorly seated control PCB can block the write." },
+      { title:"If it still won't take the ID — replace the SPM",
+        detail:"If the write repeatedly fails with the board correctly seated, the SPM's ID memory has failed. Replace the SPM." },
+    ],
+    source:"B-65285EN §3.4.10, B-64115EN App.A" },
+
+  { key:"sp9015", codes:["9015","SP9015"], title:"Speed Range Switching Alarm",
+    desc:"Spindle output switching or speed range switching sequence fault",
+    type:"SP", severity:"high",
+    summary:"The switching sequence for spindle output switching or speed range switching is abnormal. SPM shows '15'.",
+    context:"Machines with output switching or speed-range switching use magnetic contactors to change the spindle power leads. The manual's trigger is specific: 1 second or more elapsed from the switch request (SPSL/RSL) before the power-lead state-check signal (MCFN/MFNHG/RCH/RCHHG) responded. So the MC didn't move, its check-back didn't return, or the ladder switched at the wrong time.",
+    steps:[
+      { title:"Understand the trip — request vs check-back timed out",
+        detail:"15/'15' means the switch request (SPSL/RSL) went out but the power-lead check signal (MCFN/MFNHG/RCH/RCHHG) didn't confirm the new state within ~1 second. Compare request vs check-back on the CNC diagnosis screen to see which side failed." },
+      { title:"Check the switching magnetic contactor",
+        detail:"Inspect the switching MC — does it energize and close cleanly? If it won't pull in, check its control supply; if it still won't operate, replace it. A stuck/worn contact never returns the check-back." },
+      { title:"Check the MC check-back I/O and wiring",
+        detail:"The MC's auxiliary contact feeds the state-check signal back through an I/O unit. A failed I/O point or broken wire means the check never matches the request. Repair or replace the I/O / wiring." },
+      { title:"Check the ladder switching timing",
+        detail:"The sequence must complete the switch within the time window, and switching must not be attempted while the motor is active. Fix the ladder so it switches only when the drive is deactivated and within the allowed time." },
+      { title:"Replace the faulty MC",
+        detail:"If a specific MC is confirmed not switching, replace it. Worn contacts are common on machines with frequent speed changes." },
+    ],
+    source:"B-65285EN §3.4.11, B-64115EN App.A" },
+
+  { key:"sp9016", codes:["9016","SP9016"], title:"SPM RAM Error",
+    desc:"Internal RAM fault in SPM control circuit — replace SPM control PCB",
+    type:"SP", severity:"high",
+    summary:"The SPM detected an internal RAM error on its control circuit. SPM shows '16'.",
+    context:"The SPM control PCB failed its internal data-RAM test. This is a hardware fault on the control circuit — there is no parameter or wiring fix, but rule out a transient and a loose board before condemning the unit.",
+    steps:[
+      { title:"Power cycle and retest",
+        detail:"Turn off all power, wait 30 seconds, power on. Unlikely to clear a real RAM fault, but it rules out a one-time transient before you open anything." },
+      { title:"Reseat the SPM control PCB (faceplate)",
+        detail:"Power off and push the faceplate fully home so its connectors mate. A poorly seated control board can fail its self-test." },
+      { title:"Check for recent service or heavy vibration",
+        detail:"If the faceplate was recently removed, or the machine vibrates heavily, the board can back out of its connector. Confirm it is fully latched." },
+      { title:"Replace the SPM control PCB",
+        detail:"If it persists with the board correctly seated, the control-circuit RAM has failed. Replace the control PCB (faceplate module)." },
+      { title:"Replace the whole SPM",
+        detail:"If a new control PCB isn't available or doesn't clear it, replace the entire Spindle Amplifier." },
+    ],
+    source:"B-65285EN §3.4.12, B-64115EN App.A" },
+  { key:"sp9017", codes:["9017","SP9017"], title:"Amplifier ID Data Error",
+    desc:"Error in SPM amplifier ID data — reseat control PCB, then replace SPM",
+    type:"SP", severity:"med",
+    summary:"The SPM detected an error in its amplifier ID data. SPM shows '17'.",
+    context:"The SPM reads its stored amplifier ID at power-up. This alarm fires when that ID data is unreadable or corrupted — most often because the control PCB (faceplate module) has worked loose, less often because the SPM itself has failed.",
+    steps:[
+      { title:"Power cycle and retest",
+        detail:"Turn off all power, wait 30 seconds, power on. Rules out a one-time read glitch before you open anything." },
+      { title:"Push the control PCB (faceplate) fully home",
+        detail:"The most common cause is a loose control PCB. Power off, press the SPM faceplate module firmly until it seats, power on and retest. A partially seated board cannot read its ID data reliably." },
+      { title:"Check for vibration or recent service on this unit",
+        detail:"If the faceplate was recently removed for service, or the machine runs with heavy vibration, the board can back out of its connector. Confirm it is fully latched." },
+      { title:"Did it follow an ID write? — 17 is corrupt data, not missing (14)",
+        detail:"17 means the stored ID is unreadable/corrupt, unlike 14 (no ID registered at all). If it appeared right after an amplifier-ID write, the write may not have completed — re-do the ID write (see SP9014) with the faceplate fully seated." },
+      { title:"Replace the SPM",
+        detail:"If the board is correctly mounted, a re-write doesn't hold, and the alarm persists, the ID data or its memory in the SPM has failed. Swap in a working SPM, or bring the unit to the lab." },
+    ],
+    source:"B-65285EN §3.4.13, B-64115EN App.A" },
+
+  { key:"sp9019", codes:["9019","SP9019"], title:"Phase U Current Offset Error",
+    desc:"Phase U current-detection offset too high at power-up — check PCB plugging, then replace SPM",
+    type:"SP", severity:"high",
+    summary:"The offset voltage of the phase U current-detection circuit is too high. Checked at power-on. SPM shows '19'.",
+    context:"At every power-up the SPM zeroes its U/V current-detection circuits. If the phase U circuit's initial offset is out of range, this alarm fires. It is an internal SPM fault — but if it appears right after a control-PCB swap, suspect a connector that isn't fully seated before condemning the unit.",
+    steps:[
+      { title:"Power cycle and retest",
+        detail:"Turn off all power, wait 30 seconds, power on. The offset check runs at power-up; a transient can trip it once." },
+      { title:"If it started right after a control-PCB replacement — check connector plugging",
+        detail:"The manual is explicit: if this alarm appears immediately after the control PCB (faceplate) was replaced, check the plugging of the connectors between the power unit and the control PCB. A half-seated inter-board connector skews the current-detection reference." },
+      { title:"Reseat the control PCB fully",
+        detail:"Power off, press the faceplate module fully home so all inter-board connectors mate, power on and retest." },
+      { title:"Replace the SPM",
+        detail:"If the alarm persists with the board correctly seated, the phase U current-detection circuit has failed. Swap in a working SPM or send the unit to the lab." },
+    ],
+    source:"B-65285EN §3.4.15, B-64115EN App.A" },
+
+  { key:"sp9020", codes:["9020","SP9020"], title:"Phase V Current Offset Error",
+    desc:"Phase V current-detection offset too high at power-up — check PCB plugging, then replace SPM",
+    type:"SP", severity:"high",
+    summary:"The offset voltage of the phase V current-detection circuit is too high. Checked at power-on. SPM shows '20'.",
+    context:"Companion to SP9019 for the V phase. At power-up the SPM zeroes its current-detection circuits; a phase V offset out of range trips this alarm. Internal SPM fault — but if it appears right after a control-PCB swap, check the inter-board connectors first.",
+    steps:[
+      { title:"Power cycle and retest",
+        detail:"Turn off all power, wait 30 seconds, power on. The offset check runs at power-up and can trip once on a transient." },
+      { title:"If it started right after a control-PCB replacement — check connector plugging",
+        detail:"Per the manual: if the alarm appears immediately after the control PCB (faceplate) was replaced, check the plugging of the connectors between the power unit and the control PCB. A half-seated connector skews the phase V reference." },
+      { title:"Reseat the control PCB fully",
+        detail:"Power off, press the faceplate module fully home so all inter-board connectors mate, power on and retest." },
+      { title:"Replace the SPM",
+        detail:"If the alarm persists with the board correctly seated, the phase V current-detection circuit has failed. Swap in a working SPM or send the unit to the lab." },
+    ],
+    source:"B-65285EN §3.4.15, B-64115EN App.A" },
+
+  { key:"sp9021", codes:["9021","SP9021"], title:"Position Sensor Polarity Incorrect",
+    desc:"Position sensor polarity parameters wrong — check P4000#0 and P4001#4",
+    type:"SP", severity:"med",
+    summary:"The position-sensor polarity/direction parameters don't match the installed sensor. SPM shows '21'. Pure parameter alarm — the manual's fix is to check and correct P4000#0 and P4001#4.",
+    context:"B-64115EN App.A names this exactly: the polarity parameter setting of the position sensor is wrong, and the remedy is to check and correct parameters No. 4000#0 and No. 4001#4. It's a parameter fault, not a wiring fault — it almost always appears right after a motor/sensor swap, a parameter restore, or first setup. (A miswired coder cable doesn't flip polarity; it drops the signal, which is 9027, not 9021.)",
+    steps:[
+      { title:"Check motor rotation direction — P4000#0",
+        detail:"SYSTEM → PARAM → 4000 → bit 0. The manual lists this parameter first. It sets the spindle/motor rotation direction; a wrong value here, on its own or combined with the sensor-polarity bit, raises '21'. Set it to match the machine's actual spindle direction. (FS15i: 3000#0.)" },
+      { title:"Check position-sensor polarity — P4001#4",
+        detail:"SYSTEM → PARAM → 4001 → bit 4. This sets the position-sensor feedback polarity / mounting direction. After a motor or coder change the new sensor may need the opposite setting. Correct it so the polarity matches the installed sensor. (FS15i: 3001#4.)" },
+      { title:"Confirm what changed just before it appeared",
+        detail:"'21' almost always follows a motor/sensor swap, a parameter restore from the wrong file, or first commissioning. Establish what was touched — that points straight at which of the two bits is wrong. If a known-good backup exists, compare 4000#0 / 4001#4 against it." },
+      { title:"Correct the parameters and power-cycle",
+        detail:"After setting P4000#0 and P4001#4 correctly, turn the CNC off and on so the spindle software re-reads them, then retest." },
+    ],
+    source:"B-65285EN §3.4.16, B-64115EN App.A" },
+
+  { key:"sp9022", codes:["9022","SP9022"], title:"Spindle Amplifier Current Overload",
+    desc:"Overcurrent exceeding SPM time rating — reduce accel/decel or cutting load",
+    type:"SP", severity:"high",
+    summary:"The motor current exceeded the time rating of the SPM continuously. SPM shows '22'.",
+    context:"Unlike SP9012 (instantaneous overcurrent), this alarm is a time-integrated overload — the SPM has been delivering more current than its sustained rating allows. Heavy cutting, frequent acceleration, or an undersized SPM for the application.",
+    steps:[
+      { title:"Review cutting conditions",
+        detail:"Check the spindle load meter during operation. If consistently above 80-90%, reduce cut depth, feedrate, or spindle speed to bring the load within the SPM's rating." },
+      { title:"Check for mechanical drag on spindle",
+        detail:"Bearing wear, belt tension, or a brake not fully releasing adds parasitic load that pushes the SPM toward its current limit even at moderate cutting loads." },
+      { title:"Check if SPM is correctly sized for the motor",
+        detail:"Verify the SPM model matches the motor specification. An undersized SPM for the installed motor will trip on current overload during normal operation." },
+      { title:"Increase acceleration time constant (P4082)",
+        detail:"If the alarm fires during accel/decel, increasing P4082 reduces the peak current demand during speed changes." },
+    ],
+    source:"B-65285EN §3.4.17, B-64115EN App.A" },
+
+  { key:"sp9027", codes:["9027","SP9027"], title:"Position Coder Disconnected",
+    desc:"αi position coder signal lost — check feedback cable and connections",
+    type:"SP", severity:"high",
+    summary:"The position coder (encoder) signal has been lost. SPM shows '27'.",
+    context:"The SPM lost the position coder feedback signal. This can happen at power-on (cable disconnected, parameter error), during operation (cable damage, connector vibration), or when the cable is moved (broken conductor). The manual gives two root causes and two remedies: the coder signal itself is abnormal (replace the cable), or the MZ/BZ sensor signal amplitude is out of adjustment (re-adjust the sensor).",
+    steps:[
+      { title:"Check feedback cable connections at both ends",
+        detail:"Verify the feedback cable is firmly seated at both the motor and the SPM. Look for bent pins, corrosion, or coolant contamination. Push the connector until you hear a click.",
+        note:"Coolant ingress into the feedback connector is the #1 field cause of this alarm on liquid-cooled spindles." },
+      { title:"Check if alarm occurs when cable is moved",
+        detail:"If the alarm appears when the spindle head moves (axis travel causes cable flexing), the conductor is intermittently broken inside the cable. Replace the cable." },
+      { title:"Check sensor parameters (B-65280EN)",
+        detail:"Verify the position coder type parameter matches the installed coder. An incorrect setting after motor or coder replacement causes this alarm at power-on." },
+      { title:"Check cable routing and shielding",
+        detail:"The feedback cable must be routed separately from motor power cables. Check that the shield is grounded properly. Add ferrite cores if noise is suspected." },
+      { title:"Check / re-adjust the MZ/BZ sensor signal amplitude",
+        detail:"The manual's second remedy: '27' also fires when the MZ/BZ sensor's signal amplitude is abnormal (adjustment drift, not a broken wire). On these αi spindles the sensor output can be checked and adjusted on the spindle check board before the sensor is condemned — re-adjust it into spec per B-65280EN. If it can't be brought into spec, replace it together with its cable." },
+      { title:"Replace feedback cable, then position coder",
+        detail:"If connections, parameters, and sensor adjustment are OK: replace the cable first (most common fix). If the alarm persists with a new cable, the position coder has failed — replace it." },
+      { title:"Replace SPM control PCB (last resort)",
+        detail:"If cable, coder, sensor, and parameters are all confirmed good, the SPM's encoder input circuit may be faulty. Replace the control PCB or SPM." },
+    ],
+    source:"B-65285EN §3.4.19, B-64115EN App.A" },
+
+  { key:"sp9029", codes:["9029","SP9029"], title:"Short-Period Overload",
+    desc:"Excessive load applied continuously for a period — or the motor shaft locked while excited. SPM shows '29'",
+    type:"SP", severity:"high",
+    summary:"An excessive load was applied to the spindle motor continuously for a certain period. The manual is explicit that this ALSO fires when the motor shaft is locked (held/clamped) while the motor is excited. SPM shows '29'.",
+    context:"B-64115EN App.A: 'Check and correct the load status. Excessive load has been applied continuously for a certain period of time. (This alarm is issued also when the motor shaft has been locked in the excitation state.)' So it is a genuine sustained-overload / stalled-while-excited alarm — distinct from 9022 (current over the amp's time rating) and 9054 (long-term overload). The key field cue the manual adds: a spindle held or clamped while still excited (an orientation clamp, a mechanical stop, or a brake dragging) trips this even without cutting.",
+    steps:[
+      { title:"Was the spindle held or clamped while excited?",
+        detail:"The manual's own note: '29' fires when the motor shaft is locked in the excitation state. Check for an orientation/index clamp still engaged, a brake not fully releasing, a mechanical stop, or the workpiece/tool jammed while the drive was commanded. Fastest thing to rule out and easy to miss." },
+      { title:"Review the cutting / load conditions",
+        detail:"Check the spindle load meter during the operation that trips it. If it sits high, reduce depth of cut, feed, or spindle speed, or add cool-down pauses, so the sustained load stays within the motor/amp rating." },
+      { title:"Check for mechanical drag on the spindle",
+        detail:"With power off, turn the spindle by hand. Bearing wear, an over-tight belt, or a brake not fully releasing adds parasitic load that keeps current high even at moderate cutting." },
+      { title:"Verify motor parameters match the installed motor",
+        detail:"A wrong motor model selected (after a motor or SPM swap) makes the SPM's overload model miscalculate. Verify the spindle motor parameters against B-65280EN for the installed motor." },
+      { title:"Check the speed feedback if the load looks normal",
+        detail:"If the load is genuinely light but '29' still trips, a degraded speed/position feedback can make the drive push extra current. Check the feedback cable and sensor before condemning the amp." },
+    ],
+    source:"B-65285EN §3.4.20, B-64115EN App.A" },
+
+  { key:"sp9030", codes:["9030","SP9030"], title:"Converter Input Overcurrent",
+    desc:"Overcurrent in the PSM main-circuit input — check supply voltage/balance and PSM sizing first. PSM shows '1', SPM shows '30'",
+    type:"SP", severity:"critical",
+    summary:"Overcurrent detected in the converter (PSM) main-circuit input. The manual's first remedy is to check and correct the power supply voltage; it names an unbalanced supply and an undersized/mis-selected PSM as causes. A genuine input short/ground fault is the other branch. PSM shows '1', SPM shows '30'. (Same converter fault as the servo-side SV0437, PS code 1.)",
+    context:"B-64115EN App.A: 'Overcurrent is detected in PSM main circuit input (PSM alarm indication: 1). Unbalanced power supply. PSM selection error (the maximum PSM output specification is exceeded).' So before assuming a dead short, the manual points at the incoming supply — voltage and phase balance — and at a PSM too small for the connected load. Confirm those, then chase a real short/ground fault.",
+    steps:[
+      { title:"Check the input supply voltage and phase balance",
+        detail:"The manual's first remedy. Measure all three input phases at the PSM. Confirm each is within spec and the three are balanced — an unbalanced or abnormal supply drives input overcurrent. Correct the supply / transformer tap if it's off." },
+      { title:"Check PSM sizing against the connected load",
+        detail:"The manual names 'PSM selection error — maximum PSM output exceeded.' If amps were added or the duty increased, the PSM may be undersized for the total spindle/servo load. Verify the PSM rating against the connected amplifiers." },
+      { title:"Check the PSM input wiring for a short or ground fault",
+        detail:"If supply and sizing are good, inspect the AC input wiring for shorts, damaged insulation, or loose connections — phase-to-phase and each phase to ground.",
+        warn:"Confirm the DC link is discharged before working on the power wiring." },
+      { title:"Megger the input power cable",
+        detail:"Disconnect the input cable at both ends and megger each conductor to ground. A low reading confirms a cable insulation fault to repair before re-powering." },
+      { title:"Check the main contactor (MCC)",
+        detail:"A welded or partially-shorted contactor pole can drive input overcurrent on close. Inspect the contacts." },
+      { title:"Replace the PSM",
+        detail:"If the supply is good and balanced, the PSM is correctly sized, and the external wiring/contactor are clean, the PSM's input rectifier circuit has failed — replace the PSM. Do not attempt internal power-device replacement in the field." },
+    ],
+    source:"B-65285EN §3.1.1, B-64115EN App.A" },
+
+  { key:"sp9031", codes:["9031","SP9031"], title:"Spindle Motor Lock / Speed Signal Loss",
+    desc:"Motor can't reach commanded speed — a real mechanical lock, OR loss of the speed-detection signal (motor sensor cable). SPM shows '31'",
+    type:"SP", severity:"critical",
+    summary:"The motor stayed below the SST speed level for a rotation command. Two manual causes: the motor genuinely cannot rotate (lock/overload), OR the speed-detection signal is abnormal so the amp only THINKS it's locked. Manual remedies: check/correct the load status, and replace the motor sensor cable. SPM shows '31' (indication 'MOTOR LOCK OR V-SIG LOS').",
+    context:"B-64115EN App.A: 'The motor cannot rotate at a specified speed (a level not exceeding the SST level for the rotation command has existed continuously). Abnormality in the speed detection signal.' Remedies: (1) check and correct the load status; (2) replace the motor sensor cable (JY2 or JY5). So don't only chase a mechanical lock — a lost/erratic speed-feedback signal makes a freely-turning spindle read as locked. That's why the manual's own name for it is 'MOTOR LOCK OR V-SIG LOSS.'",
+    steps:[
+      { title:"Check if the spindle is actually locked",
+        detail:"Power off. Try turning the spindle by hand. If it's locked: look for a tool/workpiece collision, chip jam, bearing seizure, gear damage, or an engaged clamp.",
+        warn:"Make sure the spindle brake/clamp is released before trying to turn it by hand." },
+      { title:"Check the spindle brake / clamp release",
+        detail:"A brake or orientation clamp that doesn't release holds the motor below speed. Verify the release solenoid and its supply actually operate on command." },
+      { title:"Turns freely by hand? Suspect the speed-detection signal",
+        detail:"If the spindle spins freely but '31' still trips, the amp isn't seeing speed feedback — the manual's second cause. This is the motor sensor path (velocity signal), not a mechanical fault." },
+      { title:"Replace the motor sensor cable",
+        detail:"The manual's remedy for the V-SIG-loss cause: replace the motor sensor feedback cable (carrying speed feedback from the motor sensor to the SPM). A broken conductor or coolant in the connector loses the speed signal and mimics a lock." },
+      { title:"Check the motor power leads",
+        detail:"Disconnect the motor leads at the SPM. Compare phase-to-phase resistance (all three should match) and megger each winding to ground. An open or shorted phase also prevents the motor reaching speed." },
+      { title:"Replace the SPM",
+        detail:"If the spindle turns freely, the sensor cable and signal are good, and the motor/leads check out — the SPM output or its speed-detection circuit has failed. Replace the SPM." },
+    ],
+    source:"B-65285EN §3.4.21, B-64115EN App.A" },
+
+  { key:"sp9032", codes:["9032","SP9032"], title:"Serial Communication LSI RAM Error",
+    desc:"SPM internal communication LSI RAM fault — replace SPM control PCB",
+    type:"SP", severity:"high",
+    summary:"The SPM detected an error in its serial communication LSI RAM. SPM shows '32'.",
+    context:"The SPM's serial communication chip (LSI) has detected an internal memory error. This is a hardware fault on the SPM control PCB.",
+    steps:[
+      { title:"Power cycle and retest",
+        detail:"Turn off all power, wait 30 seconds, power on. A transient glitch may clear on power cycle." },
+      { title:"Check SPM control PCB seating",
+        detail:"Power off. Push the SPM faceplate fully home until it clicks. A poorly seated PCB can cause communication errors." },
+      { title:"Replace SPM control PCB or entire SPM",
+        detail:"If the alarm persists, the serial communication LSI has failed. Replace the control PCB (faceplate) or the entire SPM." },
+    ],
+    source:"B-65285EN §3.4.22, B-64115EN App.A" },
+
+  { key:"sp9033", codes:["9033","SP9033"], title:"Converter DC Link Precharge Failure",
+    desc:"PSM DC link didn't charge when the amplifier MCC closed — open input phase or defective charging resistor. PSM shows '5', SPM shows '33'",
+    type:"SP", severity:"high",
+    summary:"When the magnetic contactor inside the amplifier closed, the DC-link voltage in the power circuit didn't charge enough. The manual names an open input phase and a defective (soft-)charging resistor. PSM shows '5', SPM shows '33'. (Same converter fault as the servo-side SV0442, PS code 5.)",
+    context:"B-64115EN App.A: 'Charging of DC power supply voltage in the power circuit section is insufficient when the magnetic contactor in the amplifier is turned on (such as open phase and defective charging resistor).' Remedies: (1) check and correct the power supply voltage; (2) replace the PSM unit. In the field a downstream amp shorting the DC link also stops it charging — isolate the link the same way as SV0442 before condemning the PSM.",
+    steps:[
+      { title:"Confirm it fires at power-up, as the MCC closes",
+        detail:"Code 5/'33' happens during the initial charge when the amplifier contactor closes, not while running. That places the fault in the input phases, the soft-charge circuit, or a downstream load on the link." },
+      { title:"Check all three input phases at the PSM",
+        detail:"Measure the 3-phase input at the PSM terminals. A missing/weak phase (the manual's 'open phase') means the caps can't charge — chase the dead phase back through the fuse, contactor, and breaker." },
+      { title:"Check the PSM input fuses and main contactor",
+        detail:"A blown input fuse or a contactor pole not closing on one phase prevents charging. Check all three phases through the fuses and MCC; investigate why a fuse blew before re-powering." },
+      { title:"Isolate the DC link to find a downstream short",
+        detail:"With the link discharged, disconnect the DC busbars to the SVMs/SPMs and power the PSM alone. If it charges now, reconnect one amp at a time until the alarm returns — that unit (or its motor/cable) is shorting the link. If it still fails with everything off, the fault is in the PSM.",
+        warn:"Confirm the DC link is fully discharged before touching any busbar." },
+      { title:"Replace the PSM (defective charging circuit)",
+        detail:"Nothing downstream loading the link, all three phases present, and it still won't charge → the PSM's soft-charge circuit (charging resistor or its relay) is defective. Replace the PSM, or bring it to the lab." },
+    ],
+    source:"B-65285EN §3.1.5, B-64115EN App.A" },
+
+  { key:"sp9034", codes:["9034","SP9034"], title:"Parameter Data Out of Range",
+    desc:"A spindle parameter is set outside its allowable range — if the number is unknown, read it on the spindle check board. SPM shows '34'",
+    type:"SP", severity:"med",
+    summary:"A spindle parameter holds a value outside the SPM's allowable range. The manual: correct the value per the parameter manual; if you don't know which parameter, connect the spindle check board and it shows the offending one. SPM shows '34'.",
+    context:"B-64115EN App.A: 'Parameter data exceeding the allowable limit is set. Correct a parameter value according to the manual. If the parameter number is unknown, connect the spindle check board, and check the indicated parameter.' It almost always follows a manual parameter edit, a restore from the wrong machine's backup, or an SPM swap without proper setup.",
+    steps:[
+      { title:"Identify what changed just before it appeared",
+        detail:"If a parameter was just edited, restored, or the SPM was swapped, that's the most likely cause. Restore the previous value if a single recent edit did it. Most spindle parameters live in the P4000–P4099 range." },
+      { title:"Read the offending parameter on the spindle check board",
+        detail:"The manual's own tip when you don't know which parameter is bad: connect the spindle check board — it indicates the specific out-of-range parameter, so you don't have to hunt through the whole set." },
+      { title:"Correct the value against B-65280EN",
+        detail:"Look up the flagged parameter's allowable range for the installed motor model in the αi Spindle Parameter Manual (B-65280EN) and set a valid value." },
+      { title:"Restore parameters from a known-good backup",
+        detail:"If several were disturbed, restore the full spindle parameter set from a backup that matches this exact machine and motor configuration." },
+      { title:"Re-initialize spindle parameters (last resort)",
+        detail:"With no backup, re-initialize the spindle parameters to the correct defaults for the installed motor model per B-65280EN." },
+    ],
+    source:"B-65285EN §3.4.23, B-64115EN App.A" },
+  { key:"sp9035", codes:["9035","SP9035"], title:"Motor Speed Mismatch (Position Coder vs Software)",
+    desc:"Large difference between the motor speed measured by the position coder and the speed the spindle software expects. SPM shows '35'",
+    type:"SP", severity:"med",
+    summary:"The SPM sees a large gap between the motor speed from the position coder and the speed estimated by the spindle software. On a rotation command it's a setup/parameter/belt problem; during a cut it's an overload. SPM shows '35'.",
+    context:"B-65285EN §3.5.2. Split the diagnosis by WHEN it fires — on a rotation command (parameter / signal / belt) vs during a cut (overload).",
+    steps:[
+      { title:"Note when it fires — rotation command vs cutting",
+        detail:"If it trips the instant a rotation command is entered, work the parameter/signal/belt causes below. If it trips during a cut, the motor was overloaded and slowed — review feed, depth and tool and lighten the cut." },
+      { title:"Check the direction parameters (4000#0, 4001#4)",
+        detail:"4000#0 sets spindle-vs-motor rotation direction; 4001#4 sets the position coder / spindle sensor mounting direction. A wrong direction bit makes the coder speed read opposite the software estimate. (FS15i: 3000#0 / 3001#4.)" },
+      { title:"Check the gear ratio parameters (4056–4059)",
+        detail:"This ratio converts coder speed to motor speed; a wrong value makes the two figures disagree. Verify against the actual gearing per B-65280EN. (FS15i: 3056–3059.)" },
+      { title:"Check the clutch / gear-select signals (CTH1A, CTH2A)",
+        detail:"Confirm CTH1A/CTH2A (FS16i G070) match the gear actually engaged. If the control thinks it's in a different gear, it applies the wrong ratio and the speeds disagree." },
+      { title:"Check for belt slippage",
+        detail:"Slip between spindle and motor pulley lets the coder-measured spindle speed fall behind the motor. Clean the pulleys and adjust belt tension so there's no slip." },
+    ],
+    source:"B-65285EN §3.5.2" },
+
+  { key:"sp9036", codes:["9036","SP9036"], title:"Error Counter Overflow",
+    desc:"The position error counter overflowed — first suspect an excessive gear ratio, then position gain, then a sequence error. SPM shows '36'",
+    type:"SP", severity:"med",
+    summary:"The error counter overflowed. Manual causes, in order: an excessively large gear ratio; then (if the ratio is right) too low a position gain; and finally a sequence error where the motor is de-excited in a position-control mode. SPM shows '36'.",
+    context:"B-65285EN §3.4.24: '(1) parameter incorrect — (a) excessively large gear ratio; (b) if gear ratio is correct, increase the position gain. (2) sequence error — motor deactivated (SFR/SRV off) in a position control mode.'",
+    steps:[
+      { title:"Confirm what changed just before it appeared",
+        detail:"'36' is a parameter/sequence fault, so it usually follows a parameter edit/restore or a change in a position-control operation. Establish what was touched or what mode was commanded." },
+      { title:"Check the gear ratio parameters (4056–4059)",
+        detail:"The manual's first named cause: an excessively large gear ratio. Verify each stage's spindle-to-motor ratio against the actual gearing and the allowable range per B-65280EN. (FS15i: 3056–3059.)" },
+      { title:"If the ratio is correct, raise the position gain",
+        detail:"With a correct gear ratio, the manual's remedy is to INCREASE the position gain — 4060–4063 (orientation), 4065–4068 (servo/spindle sync) or 4069–4072 (Cs), for the mode in use. Too low a gain lets the counter run away." },
+      { title:"Check for a sequence error (SFR/SRV dropped in a position mode)",
+        detail:"Confirm the motor wasn't de-excited by SFR/SRV dropping while in rigid tapping, Cs contour, or spindle synchronization. Fix the ladder/sequence so excitation is held through the move." },
+    ],
+    source:"B-65285EN §3.4.24" },
+
+  { key:"sp9037", codes:["9037","SP9037"], title:"Motor Not Decelerated After Emergency Stop",
+    desc:"After E-stop the motor accelerated / did not decelerate within the accel-decel time — check the accel/decel-time parameter (4082) and the speed-detector parameter. SPM shows '37'",
+    type:"SP", severity:"high",
+    summary:"After an emergency-stop input the motor accelerated instead of decelerating, or was still not de-excited once the accel/decel time (default 10 s) had elapsed. Manual causes: the accel/decel-time parameter (4082) and the speed-detector parameter. SPM shows '37'.",
+    context:"B-65285EN §3.4.25: 'After emergency stop signal input, the motor is accelerated without being decelerated... also issued when the motor is not deactivated when the acceleration/deceleration time (initial 10 s) has elapsed.' (a) speed-detector parameter incorrect; (b) accel/decel-time parameter (4082) not proper.",
+    steps:[
+      { title:"Confirm the symptom and what changed",
+        detail:"This fires on emergency stop — the spindle didn't come down in the expected time. Note any recent parameter restore or motor/sensor change, the usual trigger." },
+      { title:"Check the acceleration/deceleration time parameter (4082)",
+        detail:"Compare 4082 against the actual time the spindle needs to stop, and set the real value plus a margin. If 4082 is shorter than the machine truly takes, the SPM declares the motor 'not decelerated' and trips. (FS15i: 3082.)" },
+      { title:"Check the speed-detector parameter",
+        detail:"Verify the speed-detector parameter is correct for the installed detector per B-65280EN — a wrong detector setting makes the SPM mis-read the deceleration." },
+      { title:"Restore a known-good backup if needed",
+        detail:"If the parameter set came from the wrong file, restore the correct backup for this machine/motor, power-cycle, and retest an E-stop stop." },
+    ],
+    source:"B-65285EN §3.4.25" },
+
+  { key:"sp9041", codes:["9041","SP9041"], title:"Position Coder One-Rotation Signal Error",
+    desc:"The one-rotation (Z) signal is detected at the wrong position — check parameter, cable, then re-adjust the MZ/BZ sensor. SPM shows '41'",
+    type:"SP", severity:"high",
+    summary:"The one-rotation (Z) signal of the spindle position coder — or the MZ/BZ sensor — was detected at an unexpected position. The manual's three remedies: correct the parameter, replace the cable, and re-adjust the BZ sensor signal. SPM shows '41'.",
+    context:"B-64115EN App.A: causes are (1) the spindle position coder (JY4) one-rotation signal abnormal, (2) the MZ/BZ sensor (JY2) one-rotation signal abnormal, (3) a parameter setting error; remedies: 1 check/correct the parameter, 2 replace the cable, 3 re-adjust the BZ sensor signal. A shifted coder/coupling on the shaft also puts the Z signal at the wrong angular position.",
+    steps:[
+      { title:"Check and correct the parameter (manual remedy #1)",
+        detail:"The manual lists a parameter setting error as a cause and 'check/correct the parameter' as the first remedy. Verify the position-coder/sensor parameters match the installed device per B-65280EN before touching hardware." },
+      { title:"Check the coder/sensor mounting and coupling",
+        detail:"If the position coder or sensor has shifted on the shaft, or its coupling (e.g. Oldham) is loose, the one-rotation signal appears at the wrong angular position. Confirm it's secure and correctly aligned." },
+      { title:"Replace the feedback cable (manual remedy #2)",
+        detail:"A damaged cable can corrupt the Z signal while still passing A/B. Replace the cable — especially if the fault is intermittent or follows cable movement." },
+      { title:"Re-adjust the MZ/BZ sensor signal (manual remedy #3)",
+        detail:"The manual's third remedy: re-adjust the MZ/BZ sensor signal on the spindle check board so the one-rotation signal sits correctly relative to the A/B count. If it can't be brought into spec, replace the sensor with its cable." },
+      { title:"Replace the position coder / sensor",
+        detail:"If parameter, mounting, cable, and adjustment are all good, the coder/sensor's one-rotation generator has failed — replace it." },
+    ],
+    source:"B-65285EN §3.4.26, B-64115EN App.A" },
+
+  { key:"sp9042", codes:["9042","SP9042"], title:"Position Coder One-Rotation Signal Missing",
+    desc:"One-rotation (Z) signal not detected — replace the cable, then re-adjust the MZ/BZ sensor. SPM shows '42'",
+    type:"SP", severity:"high",
+    summary:"The one-rotation (Z) signal of the spindle position coder — or the MZ/BZ sensor — is not detected. The manual's remedies: replace the cable, and re-adjust the BZ sensor signal. SPM shows '42'.",
+    context:"B-64115EN App.A: the one-rotation signal of the spindle position coder (JY4), or of the MZ/BZ sensor (JY2), is disconnected. Remedies: 1 replace the cable, 2 re-adjust the BZ sensor signal. This is the 'not detected at all' companion to 9041 ('detected at the wrong position').",
+    steps:[
+      { title:"Check the feedback cable connection",
+        detail:"The one-rotation signal travels through the feedback cable. Check both connectors for loose or bent pins and coolant damage; reseat firmly." },
+      { title:"Replace the feedback cable (manual remedy #1)",
+        detail:"The manual's first remedy. A broken conductor stops the once-per-rev signal reaching the amp — replace the cable, especially if the fault is intermittent or follows cable movement." },
+      { title:"Re-adjust the MZ/BZ sensor signal (manual remedy #2)",
+        detail:"Re-adjust the MZ/BZ sensor signal on the spindle check board so the one-rotation pulse is generated and detected each revolution. If it can't be brought into spec, replace the sensor." },
+      { title:"Confirm the Z signal on the spindle check board",
+        detail:"Verify the one-rotation (Z) signal is actually present at the SPM check board. If no pulse appears per revolution after cable/sensor work, the coder's Z generator has failed." },
+      { title:"Check the position-coder type parameter",
+        detail:"Verify the coder-type parameter matches the installed device per B-65280EN — a wrong type makes the amp look for a signal that never comes." },
+      { title:"Replace the position coder / sensor",
+        detail:"If cable, adjustment, and parameters are all good and the Z signal still isn't generated, replace the position coder (or sensor)." },
+    ],
+    source:"B-65285EN §3.4.27, B-64115EN App.A" },
+  { key:"sp9043", codes:["9043","SP9043"], title:"Position Coder Disconnected (Differential Mode)",
+    desc:"Master-spindle position coder signal lost in differential speed control — troubleshoot as SP9027",
+    type:"SP", severity:"high",
+    summary:"The position coder signal of the master spindle used in differential spindle speed control is disconnected. SPM shows '43'.",
+    context:"On machines running differential spindle speed control, the slave spindle's SPM reads the master spindle's position coder. This alarm means that master-side coder signal was lost. Root cause and fix are the same as an ordinary position-coder disconnection (SP9027) — but on the master spindle's feedback path.",
+    steps:[
+      { title:"Confirm which spindle is the master",
+        detail:"This alarm is on the differential (slave) drive, but the fault is in the MASTER spindle's position-coder feedback. Work on the master coder cable, not the slave's." },
+      { title:"Check the master coder feedback cable at both ends",
+        detail:"Reseat the connectors at the master position coder and at the SPM. Look for bent pins, corrosion, or coolant ingress — coolant in the connector is the most common field cause." },
+      { title:"Check if the alarm follows cable movement",
+        detail:"If it appears when the head or spindle moves, a conductor is intermittently broken inside the master coder cable. Replace the cable." },
+      { title:"Check sensor parameters and cable routing",
+        detail:"Verify the master coder type parameter (B-65280EN). Keep the feedback cable separated from motor power leads and confirm the shield is grounded." },
+      { title:"Replace the master coder cable, then the coder",
+        detail:"Replace the cable first (most common fix). If the alarm persists with a new cable, replace the master spindle's position coder." },
+    ],
+    source:"B-65285EN §3.4.28 (see §3.4.19), B-64115EN App.A" },
+
+  { key:"sp9046", codes:["9046","SP9046"], title:"One-Rotation Signal Error During Threading",
+    desc:"Position coder one-rotation signal error during thread cutting — same root cause as SP9041",
+    type:"SP", severity:"high",
+    summary:"The one-rotation signal cannot be detected normally during thread cutting. SPM shows '46'. Same root cause as SP9041.",
+    context:"Thread cutting requires precise spindle position tracking via the one-rotation signal. If this signal is unreliable, the thread pitch will be incorrect and this alarm fires. Troubleshoot identically to SP9041.",
+    steps:[
+      { title:"Follow SP9041 troubleshooting",
+        detail:"This alarm has the same cause as SP9041. Check coder mounting, coupling, parameters, and feedback cable." },
+      { title:"Check spindle speed during thread cutting",
+        detail:"If the spindle speed is too high during threading, the one-rotation signal timing may be missed. Reduce the threading speed (S word) and retest." },
+      { title:"Check for spindle vibration",
+        detail:"Excessive spindle vibration during threading can cause the coder to generate erratic Z signals. Check bearing condition and balance." },
+    ],
+    source:"B-65285EN §3.4.29, B-64115EN App.A" },
+
+  { key:"sp9047", codes:["9047","SP9047"], title:"Position Coder Signal Error",
+    desc:"A/B-phase pulse count between one-rotation signals is out of range — cable, sensor adjustment, and cable routing. SPM shows '47'",
+    type:"SP", severity:"high",
+    summary:"The A/B-phase pulse count between one-rotation signals is outside the expected range (pulses missing or extra, or the A/B-to-1-rotation relationship is wrong). The manual's remedies: replace the cable, re-adjust the BZ sensor signal, and correct the cable layout away from power lines. SPM shows '47'.",
+    context:"B-64115EN App.A: the A/B-phase signal of the spindle position coder (JY4) or of the MZ/BZ sensor (JY2) is abnormal, or the relationship between the A/B phase and the one-rotation signal is incorrect (pulse-interval mismatch). Remedies: 1 replace the cable, 2 re-adjust the BZ sensor signal, 3 correct the cable layout (keep it away from power lines). Cable flex during head movement is the classic field trigger.",
+    steps:[
+      { title:"Check if the alarm follows cable movement",
+        detail:"If it appears when the spindle head moves (cable bends), a conductor inside the feedback cable is intermittently broken. Replace the cable." },
+      { title:"Check the feedback cable connectors",
+        detail:"Inspect both ends for bent pins, corrosion, or coolant contamination. Clean and reseat." },
+      { title:"Correct the cable routing — away from power lines (manual remedy #3)",
+        detail:"The A/B pulse signals are noise-sensitive. If the feedback cable runs near motor power leads, re-route it away from them; add ferrite cores if needed. The manual explicitly lists cable layout near the power line as a cause." },
+      { title:"Re-adjust the MZ/BZ sensor signal (manual remedy #2)",
+        detail:"Re-adjust the MZ/BZ sensor signal amplitude on the spindle check board so the A/B and one-rotation pulses are clean and correctly related. If it can't be brought into spec, replace the sensor." },
+      { title:"Check the position-coder parameters",
+        detail:"Verify the coder type and pulse-count parameters match the installed coder per B-65280EN — wrong settings make the amp expect the wrong pulse count between Z signals." },
+      { title:"Replace the feedback cable, then the coder",
+        detail:"Cable damage is the most common cause — replace it first (manual remedy #1). If the alarm persists, the coder's pulse generator has degraded — replace the coder." },
+    ],
+    source:"B-65285EN §3.4.30, B-64115EN App.A" },
+  { key:"sp9049", codes:["9049","SP9049"], title:"Differential Speed Conversion Overflow",
+    desc:"Converted master-spindle speed exceeds slave motor max — reduce speed / check gear ratio",
+    type:"SP", severity:"med",
+    summary:"In differential spindle speed control, the master spindle speed converted to the slave motor speed exceeded the allowable range. SPM shows '49'.",
+    context:"In differential mode the SPM converts the master spindle speed into a slave motor speed by multiplying by the slave spindle-to-motor gear ratio. If that converted value passes the slave motor's maximum speed, this alarm fires. It is an operating/parameter limit, not a hardware fault.",
+    steps:[
+      { title:"Check the commanded master spindle speed",
+        detail:"The converted slave motor speed (master speed × gear ratio) is exceeding the slave motor's maximum. Lower the master spindle speed so the converted value stays within the slave motor's rated maximum." },
+      { title:"Check the slave gear ratio parameters (4056–4059)",
+        detail:"If the gear ratio is set too high, even a normal master speed converts to an over-max motor speed. Verify the ratio matches the machine's actual gearing." },
+      { title:"Check the slave motor maximum speed parameter",
+        detail:"Confirm the slave motor's maximum speed parameter is correct for the installed motor — if set too low, normal operation trips the limit." },
+      { title:"Review the differential-mode program",
+        detail:"Confirm the part program isn't commanding a master speed that only makes sense on the master spindle but overspeeds the slave once converted." },
+    ],
+    source:"B-65285EN §3.4.31, B-64115EN App.A" },
+
+  { key:"sp9050", codes:["9050","SP9050"], title:"Spindle Sync Calculation Overflow",
+    desc:"A spindle-synchronization internal calculation overflowed — first check the gear ratio, then (if it's correct) raise the position gain. SPM shows '50'",
+    type:"SP", severity:"med",
+    summary:"A value from the internal spindle-synchronization calculation exceeded the allowable range. Manual remedy: (a) check for an excessively large gear ratio; (b) if the gear ratio is correct, increase the spindle-sync position gain. SPM shows '50'.",
+    context:"B-65285EN §3.4.32: 'A value obtained by internal calculation in spindle synchronization exceeded the allowable range. (a) gear ratio parameter incorrect — check if an excessively large gear ratio is set; (b) position gain setting limit — if correct gear ratio data is set, increase the position gain value in spindle synchronization.' Params: 4056–4059 gear ratio, 4065–4068 position gain. (Do not confuse with code 49 / §3.4.31, which is the differential-speed overspeed.)",
+    steps:[
+      { title:"Check whether parameters were recently changed",
+        detail:"This alarm almost always follows a parameter edit or restore. If you have a known-good backup, compare 4056–4059 and 4065–4068 against it first." },
+      { title:"Check the gear ratio parameters (4056–4059)",
+        detail:"The manual's first named cause: an excessively large gear ratio. Verify the spindle-to-motor ratio matches the actual gearing per B-65280EN — too large a value overflows the sync calculation. (FS15i: 3056–3059.)" },
+      { title:"If the ratio is correct, raise the position gain (4065–4068)",
+        detail:"With a correct gear ratio, the manual's remedy is to INCREASE the position gain used in spindle synchronization (4065–4068). This is the action §3.4.32(b) prescribes for code 50 — do not skip it." },
+      { title:"Confirm both spindles' sync setup is consistent",
+        detail:"Verify the master and slave spindle parameter sets are consistent for the synchronization pair — a mismatch can drive the calculation out of range." },
+    ],
+    source:"B-65285EN §3.4.32" },
+
+  { key:"sp9051", codes:["9051","SP9051"], title:"Converter DC Link Low Voltage",
+    desc:"PSM detected DC-link low voltage — momentary power failure or a poor magnetic-contactor (MC) contact. PSM shows '4', SPM shows '51'",
+    type:"SP", severity:"high",
+    summary:"The PSM detected a DC-link input-voltage drop. The manual names two causes: a momentary power failure, or a poor MC (magnetic contactor) contact — remedies are to correct the supply voltage and to replace the MC. PSM shows '4', SPM shows '51'.",
+    context:"B-64115EN App.A ('LOW VOLT DC LINK'): 'Input voltage drop was detected (PSM alarm indication: 4). Momentary power failure or poor MC contact.' Remedies: 1 check/correct the power supply voltage; 2 replace the MC. So unlike a dead PSM, the manual points first at the incoming supply and at the main contactor's contacts — a pitted/high-resistance MC pole drops the link under load and is a common, cheaper fix than the converter.",
+    steps:[
+      { title:"Check the input supply — all three phases, stable under load",
+        detail:"Measure the AC input at the PSM. A momentary dip or sag during heavy cutting or when other machines start trips this. Put a recording meter on the supply if it's intermittent." },
+      { title:"Check the magnetic contactor (MC) contacts",
+        detail:"The manual's second cause: a poor MC contact. Inspect the main contactor for pitted, worn, or high-resistance poles that drop voltage to the converter under load. This is the specific field cause behind many '51' trips." },
+      { title:"Replace the magnetic contactor (MC)",
+        detail:"If a contactor pole is pitted or reads a voltage drop across it under load, replace the MC — the manual's remedy #2. Cheaper and more likely than replacing the converter." },
+      { title:"Measure the PSM DC-link voltage",
+        detail:"If accessible, measure the DC link at the PSM P/N terminals — roughly 280 VDC (200V class) or 560 VDC (400V class) at no load. A low reading with a good supply and MC points at the converter.",
+        warn:"Confirm the DC link is discharged before touching any P/N terminal." },
+      { title:"Check for excessive simultaneous load, then the PSM",
+        detail:"If many axes/spindles draw peak current together, a marginal supply/PSM can sag. With supply, MC, and load all confirmed good and the link still low, the converter's rectifier/capacitor section has degraded — replace the PSM." },
+    ],
+    source:"B-65285EN §3.1.4, B-64115EN App.A" },
+  { key:"sp9052", codes:["9052","SP9052"], title:"ITP Signal Error I",
+    desc:"Sync (ITP) signal in CNC↔SPM communication stopped — replace SPM or CNC serial-spindle board",
+    type:"SP", severity:"high",
+    summary:"The synchronization signal (ITP) in the data transferred between the CNC and SPM stopped. SPM shows '52'.",
+    context:"The CNC and SPM exchange a timing/synchronization signal (ITP) over the serial spindle link. If that signal stops, the drive can no longer stay in step with the CNC. The fault is on the communication path — either the SPM or the CNC serial-spindle hardware.",
+    steps:[
+      { title:"Power cycle and retest",
+        detail:"Turn off all power, wait 30 seconds, power on. A one-time link glitch can trip this and clear on restart." },
+      { title:"Check the serial spindle cable / optical link",
+        detail:"Reseat the connectors on the CNC-to-SPM serial (optical) cable. Inspect for damage and replace a suspect cable — a marginal link drops the ITP signal." },
+      { title:"Replace the SPM (or its control PCB)",
+        detail:"If the link is good, the SPM's communication circuit is the likely fault. Swap in a working SPM, or replace the control PCB / send the unit to the lab." },
+      { title:"Replace the CNC serial-spindle board or module",
+        detail:"If a known-good SPM still alarms, the fault is on the CNC side — replace the board or module that handles the serial spindle." },
+    ],
+    source:"B-65285EN §3.4.33, B-64115EN App.A" },
+
+  { key:"sp9053", codes:["9053","SP9053"], title:"ITP Signal Error II",
+    desc:"Sync (ITP) signal in CNC↔SPM communication stopped — same fault path as SP9052",
+    type:"SP", severity:"high",
+    summary:"The synchronization signal (ITP) in CNC↔SPM communication stopped. SPM shows '53'. Same cause and fix as SP9052.",
+    context:"SP9053 is the companion detection to SP9052 — the ITP synchronization signal on the serial spindle link stopped. Troubleshoot it exactly as SP9052: the fault is on the SPM or the CNC serial-spindle hardware.",
+    steps:[
+      { title:"Power cycle and retest",
+        detail:"Turn off all power, wait 30 seconds, power on. Rules out a transient link error." },
+      { title:"Check the serial spindle cable / optical link",
+        detail:"Reseat and inspect the CNC-to-SPM serial (optical) cable; replace it if suspect." },
+      { title:"Replace the SPM (or its control PCB)",
+        detail:"If the link is good, swap in a working SPM or replace the control PCB." },
+      { title:"Replace the CNC serial-spindle board or module",
+        detail:"If a known-good SPM still alarms, replace the CNC-side serial-spindle board or module." },
+    ],
+    source:"B-65285EN §3.4.33, B-64115EN App.A" },
+
+  { key:"sp9054", codes:["9054","SP9054"], title:"Current Overload (Long-Term)",
+    desc:"Large motor current sustained for a long time — troubleshoot as SP9029",
+    type:"SP", severity:"high",
+    summary:"A large current flowing in the motor for a long time was detected. SPM shows '54'. Same diagnostic as SP9029.",
+    context:"A time-integrated current overload — the motor has drawn heavy current long enough to threaten the drive. The manual routes it to the same troubleshooting as SP9029: real cutting overload, mechanical drag, or an amplifier/parameter mismatch.",
+    steps:[
+      { title:"Review the cutting conditions",
+        detail:"Watch the spindle load meter. If it sits high during the cut, reduce depth of cut, feed, or spindle speed to bring the sustained load within the SPM rating." },
+      { title:"Check for mechanical drag on the spindle",
+        detail:"Bearing wear, over-tight belt, or a brake not fully releasing adds parasitic load that keeps current high even at moderate cutting. With power off, turn the spindle by hand and feel for resistance." },
+      { title:"Check motor-specific parameters",
+        detail:"Verify the spindle motor parameters (B-65280EN) match the installed motor. A mismatch after a motor or SPM swap makes the drive push excess current." },
+      { title:"Check the SPM is correctly sized for the motor",
+        detail:"An undersized SPM for the installed motor trips on sustained current during otherwise normal work." },
+      { title:"Check the feedback / speed signal",
+        detail:"A bad speed feedback can make the drive over-current chasing a speed it can't confirm. Check the feedback cable and coder if the load alone doesn't explain the current." },
+    ],
+    source:"B-65285EN §3.4.34 (see §3.4.20), B-64115EN App.A" },
+
+  { key:"sp9055", codes:["9055","SP9055"], title:"Power Lead Switching Status Mismatch",
+    desc:"Switch request vs. power-lead check signal mismatch during motor activation — check switching MC, I/O, ladder",
+    type:"SP", severity:"high",
+    summary:"In spindle/output switching control, a mismatch between the switch request signal (SPSL/RSL) and the power-lead state-check signal (MCFN/MFNHG/RCH/RCHHG) continued during motor activation. SPM shows '55'.",
+    context:"On machines that switch power leads (spindle switching, output switching, winding change), the SPM confirms the magnetic contactor actually moved to the requested state. This alarm fires when the request and the contactor's check-back signal stay mismatched while the motor is active — a stuck contactor, bad check wiring/I-O, or a ladder that switches at the wrong time.",
+    steps:[
+      { title:"Check the switching magnetic contactor",
+        detail:"Inspect the power-lead switching MC. Confirm it energizes and its contacts actually change state. If the contact is inoperative, check the MC's own control power; if it still won't move, replace the MC." },
+      { title:"Check the MC check-back I/O and wiring",
+        detail:"The contactor's auxiliary contact feeds the state-check signal (MCFN/MFNHG/RCH/RCHHG) back through an I/O unit. A failed I/O point or broken wire makes the check signal never match the request. Repair or replace the I/O unit / wiring." },
+      { title:"Check the ladder switching sequence",
+        detail:"The alarm fires specifically when switching is attempted during motor activation. Modify the ladder so power-lead switching is NOT performed while the motor is active — switch only when the drive is deactivated." },
+      { title:"Compare request vs. feedback on the diagnostic screen",
+        detail:"While forcing the switch, compare the switch request signal (SPSL/RSL) against the check signal on the CNC diagnosis screen. Whichever side fails to change points at the faulty element." },
+    ],
+    source:"B-65285EN §3.4.35, B-64115EN App.A" },
+  { key:"sp9057", codes:["9057","SP9057"], title:"Converter Excess Deceleration Power",
+    desc:"Regenerative-resistor overheat on the αiPSR converter — the fix is converter-side (PS 'H')",
+    type:"SP", severity:"high",
+    summary:"A converter regenerative-resistor overheat. The αiPS/αiPSR faceplate shows 'H', the SPM shows '57' — one physical fault on the converter, reported on both displays.",
+    context:"This is not a spindle fault. On αiPSR units (with an external regenerative resistor) it means the resistor temperature has risen abnormally — the machine is dumping more deceleration energy into the resistor than it can dissipate. The spindle amp only reports it; the fix is on the converter side. Solve it on the PS card.",
+    steps:[
+      { title:"Confirm both faceplates — SP '57' and PS 'H'",
+        detail:"Read the αiPS/αiPSR faceplate. It should show 'H' at the same time the spindle shows '57'. Same physical fault, two displays — work it as a converter fault, not a spindle one." },
+      { title:"Go to the PS solution card",
+        detail:"The full diagnosis and fix live on the converter card (PS 'H' — CNV Excess Deceleration Power). Use the converter banner above to jump to it: check regen-resistor wiring and spec, reduce accel/decel duty, and check the resistor cooling fan." },
+      { title:"Reduce acceleration/deceleration frequency as an immediate measure",
+        detail:"If production must continue, lowering the rate of repeated accel/decel cycles gives the resistor time to cool and can keep the alarm from re-tripping while the converter-side cause is addressed." },
+    ],
+    source:"B-65285EN §3.1.12, B-64115EN App.A" },
+
+  { key:"sp9004", codes:["9004","SP9004"], title:"Converter Open Phase",
+    desc:"Missing input phase on PSM — check power supply, fuses, and contactor",
+    type:"SP", severity:"high",
+    summary:"The PSM detected an open phase (missing phase) in its main AC input. PSM shows 'E', SPM shows '04'.",
+    context:"The PSM requires all three input phases to operate. If one phase is missing (blown fuse, open contactor contact, broken wire), this alarm fires. Can also appear intermittently if a loose connection drops out under vibration or thermal expansion.",
+    steps:[
+      { title:"Check all three input phases at PSM terminals",
+        detail:"Measure AC voltage between each phase pair (R-S, S-T, T-R) at the PSM input terminals. All three should be within 10% of each other. One significantly lower or zero = open phase." },
+      { title:"Check PSM input fuses",
+        detail:"Check all three input fuses. A blown fuse on one phase causes open phase detection. Investigate the cause before replacing." },
+      { title:"Check main contactor (MCC) contacts",
+        detail:"A worn or pitted contactor contact may not close on one phase. Inspect all three sets of contacts. Replace the contactor if contacts are burned." },
+      { title:"Trace the wiring back to the breaker",
+        detail:"If fuses and contactor are OK, check wiring continuity from the breaker through the contactor to the PSM. Look for loose terminal screws or corroded connections." },
+    ],
+    source:"B-65285EN §3.1.10, B-64115EN App.A" },
+  { key:"sp9058", codes:["9058","SP9058"], title:"Converter Main Circuit Overload",
+    desc:"PSM main-circuit overload (heatsink overheat) — the fix is converter-side (PS '3')",
+    type:"SP", severity:"high",
+    summary:"A converter main-circuit overload. The αiPS faceplate shows '3', the SPM shows '58' — one fault on the converter, reported on both displays.",
+    context:"This is not a spindle fault. The PSM main-circuit heatsink is too hot — cooling fan, dust build-up, an undersized PSM for the load, or high ambient. The spindle amp only reports it; the fix is converter-side. Solve it on the PS card.",
+    steps:[
+      { title:"Confirm both faceplates — SP '58' and PS '3'",
+        detail:"Read the αiPS faceplate. It should show '3' at the same time the spindle shows '58'. Same physical fault, two displays — work it as a converter fault, not a spindle one." },
+      { title:"Go to the PS solution card",
+        detail:"The full diagnosis and fix live on the converter card (PS '3' — CNV Overload). Use the converter banner above: check the main-circuit cooling fan, clean the heatsink, and verify PSM sizing and ambient temperature." },
+    ],
+    source:"B-65285EN §3.1.3, B-64115EN App.A" },
+
+  { key:"sp9059", codes:["9059","SP9059"], title:"Converter Cooling Fan Stopped",
+    desc:"PSM cooling fan stopped — the fix is converter-side (PS '2')",
+    type:"SP", severity:"high",
+    summary:"A converter cooling-fan failure. The αiPS faceplate shows '2', the SPM shows '59' — one fault on the converter, reported on both displays.",
+    context:"This is not a spindle fault. A cooling fan inside the PSM has stopped. The spindle amp only reports it; the fix is converter-side. Solve it on the PS card.",
+    steps:[
+      { title:"Confirm both faceplates — SP '59' and PS '2'",
+        detail:"Read the αiPS faceplate. It should show '2' at the same time the spindle shows '59'. Same physical fault, two displays — work it as a converter fault, not a spindle one." },
+      { title:"Go to the PS solution card",
+        detail:"The full diagnosis and fix live on the converter card (PS '2' — CNV Cooling Fan Failure). Use the converter banner above: check the fan and its connector, and reseat the control PCB." },
+    ],
+    source:"B-65285EN §3.1.2, B-64115EN App.A" },
+
+  { key:"sp9111", codes:["9111","SP9111"], title:"Converter Control Power Low Voltage",
+    desc:"PSM control power supply undervoltage — the fix is converter-side (PS '6')",
+    type:"SP", severity:"high",
+    summary:"A converter control-power undervoltage. The αiPS faceplate shows '6', the SPM shows 'b1' — one fault on the converter, reported on both displays.",
+    context:"This is not a spindle fault. The PSM's internal 24V control power supply has dropped — internal fuse or low input voltage. That 24V rail feeds every amp on the CXA2A/B chain. The spindle amp only reports it; the fix is converter-side.",
+    steps:[
+      { title:"Confirm both faceplates — SP 'b1' and PS '6'",
+        detail:"Read the αiPS faceplate. It should show '6' at the same time the spindle shows 'b1'. Same physical fault, two displays — work it as a converter fault, not a spindle one." },
+      { title:"Go to the PS solution card",
+        detail:"The full diagnosis and fix live on the converter card (PS '6' — CNV Control Voltage Drop). Use the converter banner above: check input voltage and the PSM's internal 24V supply/fuse." },
+    ],
+    source:"B-65285EN §3.1.6, B-64115EN App.A" },
+
+  { key:"sp9112", codes:["9112","SP9112"], title:"Converter Excessive Regenerative Power",
+    desc:"PSMR short-term regenerative power exceeded — the fix is converter-side (PS '8')",
+    type:"SP", severity:"high",
+    summary:"A converter excessive-regenerative-power event. The αiPS faceplate shows '8', the SPM shows 'b2' — one fault on the converter, reported on both displays.",
+    context:"This is not a spindle fault. On αiPSR units, a single braking event pushed more regenerative power back than the resistor can absorb. Distinct from 'H' (thermal accumulation) — this is a short-term peak. The spindle amp only reports it; the fix is converter-side.",
+    steps:[
+      { title:"Confirm both faceplates — SP 'b2' and PS '8'",
+        detail:"Read the αiPS faceplate. It should show '8' at the same time the spindle shows 'b2'. Same physical fault, two displays — work it as a converter fault, not a spindle one." },
+      { title:"Go to the PS solution card",
+        detail:"The full diagnosis and fix live on the converter card (PS '8' — CNV Excessive Regenerative Power). Use the converter banner above: check the regen-resistor spec/wiring and reduce heavy deceleration rates." },
+    ],
+    source:"B-65285EN §3.1.8, B-64115EN App.A" },
+
+  { key:"sp9113", codes:["9113","SP9113"], title:"Converter Radiator Fan Stopped",
+    desc:"PSM radiator (external dissipator) cooling fan stopped — the fix is converter-side (PS 'A')",
+    type:"SP", severity:"high",
+    summary:"A converter radiator-fan failure. The αiPS faceplate shows 'A', the SPM shows 'b3' — one fault on the converter, reported on both displays.",
+    context:"This is not a spindle fault. The external radiator (dissipator) cooling fan on the PSM has stopped. The spindle amp only reports it; the fix is converter-side. Solve it on the PS card.",
+    steps:[
+      { title:"Confirm both faceplates — SP 'b3' and PS 'A'",
+        detail:"Read the αiPS faceplate. It should show 'A' at the same time the spindle shows 'b3'. Same physical fault, two displays — work it as a converter fault, not a spindle one." },
+      { title:"Go to the PS solution card",
+        detail:"The full diagnosis and fix live on the converter card (PS 'A' — CNV External Cooling Fan). Use the converter banner above: replace the radiator fan and check the control PCB seating." },
+    ],
+    source:"B-65285EN §3.1.9, B-64115EN App.A" },
+
+  // ── SPINDLE-SIDE ALARMS (αiSP amp / spindle, not converter redirects) ──
+  { key:"sp9056", codes:["9056","SP9056"], title:"SPM Control-Circuit Fan Stopped",
+    desc:"The cooling fan for the SPM control-circuit section has stopped — SPM shows '56'. Usually a half-seated faceplate, not a dead fan",
+    type:"SP", severity:"high",
+    summary:"The fan that cools the SPM control PCB has stopped. Before you condemn the fan, check the faceplate — this alarm often means the control PCB simply isn't pushed home.",
+    context:"This is the control-circuit fan (on the faceplate/control PCB), not the big main-circuit heatsink fan. The manual's first cause is a poorly installed control PCB: if the faceplate isn't fully seated, one of the connectors between the control PCB and the power PCB can be unmated, which reads as a stopped fan. So this is a 30-second check before any parts get pulled.",
+    steps:[
+      { title:"Push the faceplate (control PCB) fully home",
+        detail:"Press the SPM faceplate in until it clicks. The fan and the control-to-power-PCB connectors only mate when it's fully seated. The manual explicitly lists a half-installed control PCB as the primary cause of a false '56'." },
+      { title:"Check the fan connector on the control PCB",
+        detail:"Remove the faceplate and confirm the fan cable connector is firmly seated on its header. Reseat it. Look for a detached connector between the control PCB and the power PCB." },
+      { title:"Check the fan blades for obstruction",
+        detail:"Spin the fan by hand — look for debris, chips, or a seized bearing blocking rotation." },
+      { title:"Replace the internal fan, then the SPM",
+        detail:"If the fan won't run with clear blades and a good connection, replace the internal cooling fan. If a known-good fan still throws '56', the SPM's fan-drive circuit has failed — replace the SPM." },
+    ],
+    source:"B-65285EN §3.4.36, B-64115EN App.A" },
+
+  { key:"sp9061", codes:["9061","SP9061"], title:"Excessive Dual-Feedback Position Error",
+    desc:"Semi-closed vs closed-loop position difference exceeded the level in param 4354 (dual position feedback) — SPM shows '61'",
+    type:"SP", severity:"high",
+    summary:"On a dual-position-feedback spindle, the gap between the motor-end (semi-closed) and spindle-end (closed) position readings grew past the limit in parameter 4354. Either the setup is wrong, the limit is too tight, or there's real slip between motor and spindle.",
+    context:"This only appears on spindles running dual position feedback (both a motor sensor and a separate spindle sensor). The drive compares the two; when they disagree by more than parameter 4354 allows, it alarms. Where it happens tells you the cause: on a fresh setup it's parameters; on a machine that ran fine it's mechanical slip or noise.",
+    steps:[
+      { title:"New setup — check the conversion-coefficient parameters",
+        detail:"If '61' appears at first machine start-up, check the motor-end position-feedback conversion coefficients: Nos. 4171/4172 (high gear) and 4173/4174 (low gear). Also verify the sensor-related parameters per the αi Spindle Parameter Manual (B-65280EN). A wrong coefficient makes the two feedbacks diverge immediately." },
+      { title:"Parameters correct — raise the detection level (4354)",
+        detail:"If the conversion coefficients are right and it still trips, the level set in parameter No. 4354 may simply be too low for this machine. Widen it within reason." },
+      { title:"Ran fine before — check for motor-to-spindle slip",
+        detail:"On a system that was working normally, suspect mechanical slippage between the motor and the spindle (belt, coupling, or key). Inspect the drive train — a slipping belt makes motor-end and spindle-end positions drift apart." },
+      { title:"Intermittent — chase feedback noise",
+        detail:"If it trips only occasionally on a healthy machine, a count error from noise on the motor-end or spindle-end feedback signal is likely. Check cable shielding and grounding, and route feedback away from power cables." },
+    ],
+    source:"B-65285EN §3.4.37, B-64115EN App.A" },
+
+  { key:"sp9066", codes:["9066","SP9066"], title:"Spindle–Amplifier Communication Error",
+    desc:"Communication error over connector JX4 between the spindle sensor and the amplifier — SPM shows '66'",
+    type:"SP", severity:"high",
+    summary:"The link over connector JX4 between the spindle sensor and the SPM failed. Almost always the JX4 connection or its cable.",
+    context:"JX4 carries the spindle-sensor/inter-amplifier communication into the SPM. When that serial link drops, the amp raises '66'. It's a connection-and-cable fault first, amplifier second.",
+    steps:[
+      { title:"Check the JX4 connector at the amplifier",
+        detail:"Verify the JX4 connector is firmly seated on the SPM. Look for bent pins, backed-out terminals, or corrosion. Reseat it." },
+      { title:"Check / replace the JX4 cable",
+        detail:"Inspect the cable running to JX4 for damage, crushing, or loose terminations along its whole run. If the connection is sound but the alarm holds, replace the cable — the manual's second action." },
+      { title:"Replace the SPM if connector and cable are good",
+        detail:"If JX4 and its cable check out and '66' persists, the SPM's communication circuit has failed — replace the amplifier." },
+    ],
+    source:"B-65285EN §3.4.39, B-64115EN App.A" },
+
+  { key:"sp9067", codes:["9067","SP9067"], title:"Ref Return Commanded in Spindle EGB Mode",
+    desc:"A reference-position-return command was issued to the slave axis while spindle EGB (G81) was active — SPM shows '67'",
+    type:"SP", severity:"med",
+    summary:"This isn't a hardware fault. A reference return was commanded on the slave axis while the spindle Electronic Gear Box (EGB) synchronization mode was on. Reference return isn't allowed in EGB mode.",
+    context:"Spindle EGB (G81) locks the slave axis in electronic sync with a master. You cannot perform a reference position return while that sync is engaged, so the command is rejected with '67'. The fix is in the program/operation sequence, not the amplifier.",
+    steps:[
+      { title:"Cancel EGB mode before referencing (G80)",
+        detail:"Turn the spindle EGB mode OFF with G81's cancel command (G80), then perform the reference position return. Reference return cannot run while G81 is active." },
+      { title:"Fix the program sequence",
+        detail:"If this fired from an NC program, reorder it so any reference return happens outside the EGB (G81…G80) block. Confirm no macro or PMC path commands a ref return while EGB is engaged." },
+    ],
+    source:"B-65285EN §3.4.40, B-64115EN App.A" },
+
+  { key:"sp9110", codes:["9110","SP9110"], title:"Communication Error Between Amplifiers",
+    desc:"Serial communication failed across the amplifier chain (SP ↔ SV ↔ PS) on CXA2A/CXA2B — SPM shows 'b0'",
+    type:"SP", severity:"high",
+    summary:"The 24 V serial link that ties every amplifier together — Spindle, Servo, and Power Supply on the CXA2A/CXA2B daisy chain — reported a communication error. SPM shows 'b0'. Most common right after power-on: a mis-coupled connector or a bad interface cable.",
+    context:"All amplifiers on the drive rack share a serial link through CXA2A→CXA2B. If that chain is broken, mis-wired, or an amplifier on it is faulty, this alarm fires. When it appears the instant CNC power comes on, it's nearly always the connector coupling or the cable — not a dead amplifier.",
+    steps:[
+      { title:"Check the CXA2A / CXA2B coupling",
+        detail:"If 'b0' appears right after power-on, check how the connectors are coupled: CXA2A on the upstream unit must mate to CXA2B on the next. Walk the chain PS→SV→SP and confirm every hop is CXA2A→CXA2B, not reversed or into the wrong port." },
+      { title:"Check the interface cable and pin numbers",
+        detail:"A defective CXA2A/B cable breaks the link. Verify the connection pin numbers are correct and the cable is undamaged; correct the wiring or replace the cable." },
+      { title:"Isolate the faulty amplifier",
+        detail:"If coupling and cable are good, one unit on the chain is defective. Disconnect amplifiers from the chain one at a time to find which one clears the alarm — the Spindle, Servo, or Power Supply (or its control PCB) is at fault. Replace that unit or its control PCB." },
+    ],
+    source:"B-65285EN §3.4.66, B-64115EN App.A" },
+
+  { key:"sp9065", codes:["9065","SP9065"], title:"Magnetic Pole Detection Error (BiS)",
+    desc:"Abnormal travel distance in magnetic-pole determination — BiS series (synchronous) spindle motors only. SPM shows '65'",
+    type:"SP", severity:"high",
+    summary:"The synchronous spindle motor failed its magnetic-pole detection. At first start-up suspect parameters and wiring; on a machine that ran fine, suspect a locked motor, sensor/rotor slip, or noise.",
+    context:"BiS synchronous spindle motors must find the rotor's magnetic pole position before running. If the motor can't move smoothly during detection, or the sensor/phase setup is wrong, '65' fires. The manual splits causes: at first start, all of (a)–(f); on a previously-good machine, only slip, friction/lock, or noise.",
+    steps:[
+      { title:"Check sensor-teeth and motor-phase parameters",
+        detail:"Verify the number-of-teeth parameters (bits 2,1,0 of No. 4011 and No. 4334) and the number-of-phases parameters (bits 7,3 of No. 4011 and No. 4368) are correct for this motor." },
+      { title:"Check power-lead phase sequence vs sensor feedback",
+        detail:"The phase sequence of the motor power lead must match the motor-sensor feedback connection. A swapped phase makes pole detection impossible. Also confirm the power lead is actually connected." },
+      { title:"Confirm the motor can move smoothly",
+        detail:"If the motor is locked (brake, clamp, jammed tooling) or friction is high with low excitation current, detection fails. Free the spindle and detect the pole where the motor can move smoothly." },
+      { title:"Check for sensor/rotor slip and noise",
+        detail:"If the sensor or rotor shaft slipped, the phase relationship between sensor and rotor changed — re-establish it. Intermittent trips on a good machine point to feedback count errors from noise: check shielding and grounding." },
+    ],
+    source:"B-65285EN §3.4.38, B-64115EN App.A" },
+
+  // ── DUAL CHECK SAFETY (DCS) SPINDLE ALARMS — machines with the DCS option only ──
+  { key:"sp9069", codes:["9069","SP9069"], title:"DCS: Safety Speed Exceeded",
+    desc:"Dual Check Safety — spindle speed exceeded the safety speed while the guard was open (safety signal mode C). SPM shows '69'",
+    type:"SP", severity:"high",
+    summary:"DCS machines only. With a guard-open request active, the spindle motor ran faster than the configured safety speed. Check the operation first, then the safety-speed parameter, then the SPM control PCB.",
+    context:"Under Dual Check Safety signal mode C, opening the guard limits the spindle to a safety speed. Exceeding it trips '69'. This is a safety-chain alarm — treat the speed limit as law, don't just widen it to make the alarm go away.",
+    steps:[
+      { title:"Observe the safety speed while the guard is open",
+        detail:"If the guard is open, the spindle must stay at or below the safety speed. Check whether the program or operator commanded a higher speed with the guard open — that's the alarm doing its job." },
+      { title:"Check the safety-speed parameter",
+        detail:"Verify the safety-speed parameter is set to the value the machine builder specified for guard-open operation. Wrong (too low) settings cause nuisance trips.",
+        warn:"Never raise the safety speed beyond the machine builder's specification — it exists to protect the operator with the guard open." },
+      { title:"Replace the SPM control PCB",
+        detail:"If operation and parameter are correct and '69' persists, the Spindle Amplifier control printed-circuit board is faulty — replace it." },
+    ],
+    source:"B-65285EN §3.4.41, B-64115EN App.A" },
+
+  { key:"sp9070", codes:["9070","SP9070"], title:"DCS: Abnormal Axis Data",
+    desc:"Dual Check Safety — spindle amplifier connection status doesn't match the hardware setting. SPM shows '70'",
+    type:"SP", severity:"high",
+    summary:"DCS machines only. The amplifier's connection status disagrees with the hardware setting — usually after wiring or configuration changes.",
+    context:"DCS cross-checks how the spindle amplifier is connected against the configured hardware setting. A mismatch — wrong connection, wrong setting, or a fault in the checking hardware — raises '70'.",
+    steps:[
+      { title:"Check the SP connection and its setting",
+        detail:"Verify the Spindle Amplifier's physical connection matches the configured hardware setting — especially after any rewiring, amp swap, or configuration change." },
+      { title:"Replace the CNC CPU card or SPM control PCB",
+        detail:"If connection and setting agree and the alarm persists, one side of the check is faulty: replace the CPU card in the CNC or the Spindle Amplifier control printed-circuit board." },
+    ],
+    source:"B-65285EN §3.4.42, B-64115EN App.A" },
+
+  { key:"sp9071", codes:["9071","SP9071"], title:"DCS: Abnormal Safety Parameter",
+    desc:"Dual Check Safety — a safety parameter error occurred. SPM shows '71'",
+    type:"SP", severity:"high",
+    summary:"DCS machines only. A safety parameter failed its check. Re-set the safety parameters; if that doesn't hold, it's the CPU card or SPM control PCB.",
+    context:"DCS keeps a protected set of safety parameters and validates them. If validation fails, '71' fires. First action is always re-setting the safety parameters from known-good values.",
+    steps:[
+      { title:"Re-set the safety parameters",
+        detail:"Reload the safety parameters from the machine's documented values or backup, following the DCS setup procedure." },
+      { title:"Replace the CNC CPU card or SPM control PCB",
+        detail:"If freshly re-set safety parameters still alarm, replace the CPU card in the CNC or the Spindle Amplifier control printed-circuit board." },
+    ],
+    source:"B-65285EN §3.4.43, B-64115EN App.A" },
+
+  { key:"sp9072", codes:["9072","SP9072"], title:"DCS: Motor Speed Mismatch",
+    desc:"Dual Check Safety — the SP's speed check disagrees with the CNC's speed check. SPM shows '72'",
+    type:"SP", severity:"high",
+    summary:"DCS machines only. The amplifier and the CNC each check motor speed independently; their results disagreed. The manual's action is hardware replacement — CPU card or SPM control PCB.",
+    context:"DCS runs the same speed check twice — once in the CNC, once in the amplifier — and compares. A mismatch means one of the two checking channels is wrong, which is exactly what DCS exists to catch.",
+    steps:[
+      { title:"Replace the CNC CPU card or SPM control PCB",
+        detail:"The manual's direct action: replace the CPU card in the CNC or the Spindle Amplifier control printed-circuit board. Start with the SPM control PCB if the alarm follows the amplifier, the CPU card if it follows the control." },
+    ],
+    source:"B-65285EN §3.4.44, B-64115EN App.A" },
+
+  { key:"sp9073", codes:["9073","SP9073"], title:"Motor Sensor Disconnected",
+    desc:"The motor sensor (αiMZ/αiBZ) feedback signal is disconnected — SPM shows '73'. WHEN it fires tells you WHERE to look",
+    type:"SP", severity:"high",
+    summary:"The SPM lost the motor-sensor signal. The manual keys the diagnosis to when it happens: at power-on with the motor off → parameters/cable/sensor adjustment; when the cable moves → broken conductor or coolant; when the motor rotates → shielding or cable routing.",
+    context:"This is the motor-end sensor (on the spindle motor itself). The failure moment is the best clue the manual gives you — use it before swapping parts. The sensor cable connects to pin 10 on the SP side; it must be a shielded cable, routed away from power leads.",
+    steps:[
+      { title:"Fires with motor deactivated — check sensor parameters",
+        detail:"Check the sensor-setting parameters per the αi Spindle Parameter Manual (B-65280EN). A wrong sensor type reads as 'disconnected'." },
+      { title:"Check / replace the feedback cable",
+        detail:"If parameters are right, the cable is the next suspect — replace it. If the alarm appears when the cable moves (spindle head travel), the conductor is likely broken inside: replace the cable. Coolant inside the connector? Clean it out." },
+      { title:"Check sensor adjustment",
+        detail:"Adjust the sensor signal per the manual. If it can't be adjusted into spec or no signal is observed, replace the connection cable and the sensor together." },
+      { title:"Fires while rotating — check shielding and routing",
+        detail:"Check the cable shield per B-65282EN 'Connection'. If the sensor cable is bundled with a motor power lead, separate them — induced noise from the power lead corrupts the signal at speed." },
+      { title:"Replace the SPM",
+        detail:"If sensor, cable, and routing all check out, the amplifier's sensor input circuit is faulty — replace the SPM or its control PCB." },
+    ],
+    source:"B-65285EN §3.4.45, B-64115EN App.A" },
+
+  { key:"sp9074", codes:["9074","SP9074"], title:"DCS: CPU Test Alarm",
+    desc:"Dual Check Safety — the amplifier's CPU self-test failed to end normally. SPM shows '74'",
+    type:"SP", severity:"high",
+    summary:"DCS machines only. The SPM's CPU test didn't complete normally. The documented fix is replacing the Spindle Amplifier or its control PCB.",
+    context:"DCS periodically self-tests the amplifier CPU. A failed test means the safety processor can't be trusted — the manual goes straight to hardware replacement.",
+    steps:[
+      { title:"Replace the SPM or its control PCB",
+        detail:"Replace the Spindle Amplifier or the Spindle Amplifier control printed-circuit board. There is no parameter or wiring fix for a failed CPU self-test." },
+    ],
+    source:"B-65285EN §3.4.46, B-64115EN App.A" },
+
+  { key:"sp9075", codes:["9075","SP9075"], title:"DCS: CRC Test Alarm",
+    desc:"Dual Check Safety — an error occurred in the CRC test. SPM shows '75'",
+    type:"SP", severity:"high",
+    summary:"DCS machines only. The amplifier's CRC (memory integrity) test failed. Replace the Spindle Amplifier or its control PCB.",
+    context:"The CRC test validates the safety firmware/data in the amplifier. A failure means corrupted or unreliable memory in the safety path.",
+    steps:[
+      { title:"Replace the SPM or its control PCB",
+        detail:"Replace the Spindle Amplifier or the Spindle Amplifier control printed-circuit board — the manual's direct action for a CRC test failure." },
+    ],
+    source:"B-65285EN §3.4.47, B-64115EN App.A" },
+
+  { key:"sp9076", codes:["9076","SP9076"], title:"DCS: Safety Function Not Executed",
+    desc:"Dual Check Safety — the spindle safety function was not executed. SPM shows '76'",
+    type:"SP", severity:"high",
+    summary:"DCS machines only. The spindle safety function failed to execute. The documented fix is replacing the SPM control PCB.",
+    context:"When the safety function that should run in the amplifier doesn't execute, DCS raises '76'. This is amplifier-side.",
+    steps:[
+      { title:"Replace the SPM control PCB",
+        detail:"Replace the Spindle Amplifier control printed-circuit board — the manual's direct action when the safety function is not executed." },
+    ],
+    source:"B-65285EN §3.4.48, B-64115EN App.A" },
+
+  { key:"sp9077", codes:["9077","SP9077"], title:"DCS: Axis Number Mismatch",
+    desc:"Dual Check Safety — the SP's axis-number check disagrees with the CNC's. SPM shows '77'",
+    type:"SP", severity:"high",
+    summary:"DCS machines only. The amplifier and CNC independently check the axis number and disagreed. Replace the CNC CPU card or the SPM control PCB.",
+    context:"Like the speed check, DCS verifies the axis number in both channels. A mismatch is a checking-hardware fault.",
+    steps:[
+      { title:"Replace the CNC CPU card or SPM control PCB",
+        detail:"Replace the CPU card in the CNC or the Spindle Amplifier control printed-circuit board — the manual's direct action for an axis-number check mismatch." },
+    ],
+    source:"B-65285EN §3.4.49, B-64115EN App.A" },
+
+  { key:"sp9078", codes:["9078","SP9078"], title:"DCS: Safety Parameter Mismatch",
+    desc:"Dual Check Safety — the SP's safety-parameter check disagrees with the CNC's. SPM shows '78'",
+    type:"SP", severity:"high",
+    summary:"DCS machines only. The safety parameters held by the amplifier don't match those held by the CNC. Re-set them; if the mismatch persists, replace the CPU card or SPM control PCB.",
+    context:"Both channels keep a copy of the safety parameters and cross-check them. After a board swap or parameter restore on one side only, the copies can disagree.",
+    steps:[
+      { title:"Re-set the safety parameters on both sides",
+        detail:"Redo the DCS safety-parameter setup so the CNC and amplifier hold the same validated set — especially after replacing a board or restoring parameters." },
+      { title:"Replace the CNC CPU card or SPM control PCB",
+        detail:"If a clean re-set still mismatches, replace the CPU card in the CNC or the Spindle Amplifier control printed-circuit board." },
+    ],
+    source:"B-65285EN §3.4.50, B-64115EN App.A" },
+
+  { key:"sp9079", codes:["9079","SP9079"], title:"DCS: Abnormal Initial Test",
+    desc:"Dual Check Safety — abnormal operation detected during the initial test. SPM shows '79'",
+    type:"SP", severity:"high",
+    summary:"DCS machines only. The power-on initial safety test detected abnormal operation. Replace the Spindle Amplifier or its control PCB.",
+    context:"DCS runs an initial test sequence at start-up. Abnormal behavior during that test points at the amplifier hardware.",
+    steps:[
+      { title:"Replace the SPM or its control PCB",
+        detail:"Replace the Spindle Amplifier or the Spindle Amplifier control printed-circuit board — the manual's direct action for an abnormal initial test." },
+    ],
+    source:"B-65285EN §3.4.51, B-64115EN App.A" },
+
+  { key:"sp756", codes:["756","766"], title:"DCS: Abnormal Axis Number (2nd Spindle K76)",
+    desc:"Dual Check Safety — CNC alarm 756/766, abnormal axis number. Check the K76 jumper on JA7A of the second spindle amplifier",
+    type:"SP", severity:"high",
+    summary:"DCS machines only. On a two-spindle DCS setup, the K76 connector must be attached to JA7A of the SECOND spindle amplifier. Missing or mis-wired K76 raises 756/766. Single-spindle machines don't need K76 at all.",
+    context:"The serial spindle chain runs CNC JA41 → SP1 JA7B, then SP1 JA7A → SP2 JA7B. The second spindle's JA7A must carry the K76 terminator (a 20-pin half-pitch connector jumpering X2NDSP pin 15 to 0V pin 13). Without it, the DCS axis-number check fails.",
+    steps:[
+      { title:"Check K76 is attached to JA7A of the 2nd spindle",
+        detail:"Locate the second spindle amplifier and verify the K76 connector is mounted on its JA7A port. K76 jumpers X2NDSP (pin 15) to 0V (pin 13) in a 20-pin half-pitch connector." },
+      { title:"Verify the serial spindle chain wiring",
+        detail:"Confirm the chain order: CNC JA41 → SP1 JA7B; SP1 JA7A → SP2 JA7B; K76 on SP2 JA7A. A swapped JA7A/JA7B breaks the axis numbering. K76 is unnecessary if only the first spindle is used." },
+      { title:"Replace the SPM control PCB",
+        detail:"If the wiring and K76 are correct and 756/766 persists, replace the Spindle Amplifier control printed-circuit board." },
+    ],
+    source:"B-65285EN §3.4.83(2), B-64115EN App.A" },
+
+  // ── SPINDLE SENSOR / SIGNAL ALARMS (80–92) ─────────────────────────
+  { key:"sp9080", codes:["9080","SP9080"], title:"Destination Amplifier Alarm (JX4)",
+    desc:"A spindle alarm exists in the DESTINATION amplifier of inter-SP communication — this amp is fine. SPM shows '80'",
+    type:"SP", severity:"med",
+    summary:"Don't troubleshoot this amplifier — it's healthy. '80' means the amplifier on the other end of the JX4 link has an alarm. Go read that amp's display and work its alarm instead.",
+    context:"In inter-Spindle-Amplifier communication over JX4, an alarm on the destination amp is echoed here as '80'. The manual is explicit: there is no problem with the amplifier showing this code.",
+    steps:[
+      { title:"Read the destination amplifier's display",
+        detail:"Follow the JX4 link to the other Spindle Amplifier and read its 7-segment display — that's where the real alarm lives." },
+      { title:"Troubleshoot the destination amp's alarm",
+        detail:"Look up the destination amplifier's code in this app and work that checklist. When it clears, '80' clears with it." },
+    ],
+    source:"B-65285EN §3.4.52, B-64115EN App.A" },
+
+  { key:"sp9081", codes:["9081","SP9081"], title:"Motor Sensor 1-Rot Signal Position Error",
+    desc:"The motor-sensor one-rotation signal is generated at an incorrect position — SPM shows '81'. Gear-ratio params or sensor adjustment",
+    type:"SP", severity:"high",
+    summary:"The one-rotation signal from the motor sensor showed up where it shouldn't. Using an external one-rotation signal → check gear-ratio parameters 4171–4174 and look for slip (V-belt drives can't use the external signal). Otherwise → sensor parameters, adjustment, shielding, routing.",
+    context:"The amp counts pulses between one-rotation signals; if the signal arrives at the wrong count, '81' fires. The manual splits the diagnosis by whether an external one-rotation signal (proximity switch) is used.",
+    steps:[
+      { title:"External 1-rot signal — check gear-ratio parameters",
+        detail:"Verify gear-ratio data matches the machine: No. 4171/4173 (denominator) and 4172/4174 (numerator) of the motor-sensor-to-spindle gear ratio." },
+      { title:"External 1-rot signal — check for slip",
+        detail:"Confirm there's no slippage between spindle and motor. The external one-rotation signal cannot be used on V-belt connections — belt creep shifts the signal position every cycle." },
+      { title:"Check sensor parameters and adjustment",
+        detail:"Check the sensor-setting parameters (B-65280EN). Then adjust the αiMZ/αiBZ sensor signal; if it can't be adjusted into spec or isn't observed, replace the connection cable and sensor." },
+      { title:"Check shielding and cable routing",
+        detail:"Check the sensor-cable shield per B-65282EN, and separate the sensor cable from any motor power lead it's bundled with." },
+      { title:"Replace the SPM",
+        detail:"If all of the above check out, replace the Spindle Amplifier or its control PCB." },
+    ],
+    source:"B-65285EN §3.4.53, B-64115EN App.A" },
+
+  { key:"sp9082", codes:["9082","SP9082"], title:"Motor Sensor 1-Rot Signal Not Detected",
+    desc:"No one-rotation signal from the motor sensor — SPM shows '82'. Parameters, sensor adjustment, or the external signal itself",
+    type:"SP", severity:"high",
+    summary:"The motor-sensor one-rotation signal never arrived. Check sensor parameters, then sensor adjustment, then the external one-rotation signal at check pin EXTSC1, then the amp.",
+    context:"Without the one-rotation marker the amp can't establish spindle position. Work from parameters outward to hardware.",
+    steps:[
+      { title:"Check the sensor-setting parameters",
+        detail:"Verify the sensor parameters per the αi Spindle Parameter Manual (B-65280EN) — a wrong sensor type means the amp looks for a signal that never comes." },
+      { title:"Adjust the αiMZ/αiBZ sensor",
+        detail:"Adjust the sensor per the manual. If it can't be adjusted or no signal is observed, replace the connection cable and sensor." },
+      { title:"External signal — check EXTSC1 on the spindle check board",
+        detail:"If an external one-rotation signal is used, probe check pin EXTSC1 on the spindle check board. No pulse per rotation → replace the connection cable and the position coder." },
+      { title:"Replace the SPM",
+        detail:"If sensor and signal check out, the amplifier is faulty — replace the SPM or its control PCB." },
+    ],
+    source:"B-65285EN §3.4.54, B-64115EN App.A" },
+
+  { key:"sp9083", codes:["9083","SP9083"], title:"Motor Sensor Signal Error",
+    desc:"Pulse count of phases A/B between one-rotation signals is out of range — SPM shows '83'. Cable movement is the classic trigger",
+    type:"SP", severity:"high",
+    summary:"The amp counts phase A/B pulses each revolution; the count came up wrong. If it fires when the cable moves → broken conductor or coolant in the connector. Otherwise → parameters, sensor adjustment, shielding, routing, then the amp.",
+    context:"A pulse-count error is a signal-integrity problem. The manual's first split: does it correlate with cable movement (spindle head travel)? That's a mechanical cable failure. Steady-state errors are setup or noise.",
+    steps:[
+      { title:"Fires when the cable moves — replace the cable",
+        detail:"A conductor is likely broken inside the moving cable — replace it. If coolant has penetrated the connector, clean the connector.",
+        note:"Wiggle-test: with the alarm history open, flex the cable near connectors while rotating slowly by hand — an intermittent count error that follows your hand is a broken conductor." },
+      { title:"Check the sensor-setting parameters",
+        detail:"Verify sensor parameters per B-65280EN." },
+      { title:"Adjust the αiMZ/αiBZ sensor",
+        detail:"Adjust the sensor; if it can't be adjusted or no signal is observed, replace the connection cable and sensor." },
+      { title:"Check shielding and cable routing",
+        detail:"Check the shield per B-65282EN 'Connection', and separate the sensor cable from motor power leads." },
+      { title:"Replace the SPM",
+        detail:"All good and still counting wrong? Replace the Spindle Amplifier or its control PCB." },
+    ],
+    source:"B-65285EN §3.4.55, B-64115EN App.A" },
+
+  { key:"sp9084", codes:["9084","SP9084"], title:"Spindle Sensor Disconnected",
+    desc:"The spindle-side sensor signal was disconnected — SPM shows '84'. Same diagnosis as motor-sensor alarm 73, on the spindle sensor",
+    type:"SP", severity:"high",
+    summary:"Identical troubleshooting to alarm 73 (motor sensor disconnected), applied to the SPINDLE sensor and its cable: parameters → cable → sensor adjustment → shielding/routing → amp.",
+    context:"The manual refers alarm 84 to the alarm-73 procedure. The difference is only which sensor: this is the spindle-end sensor (position coder / αiCZ etc. on the spindle itself), not the motor-end sensor.",
+    steps:[
+      { title:"Check sensor parameters",
+        detail:"Check the spindle-sensor setting parameters per B-65280EN — wrong type reads as disconnected." },
+      { title:"Check / replace the spindle-sensor cable",
+        detail:"If the alarm appears when the cable moves, the conductor is broken — replace the cable. Clean coolant out of connectors." },
+      { title:"Adjust or replace the sensor",
+        detail:"Adjust the sensor signal; if it won't come into spec or isn't observed, replace cable and sensor together." },
+      { title:"Check shielding and routing; then the SPM",
+        detail:"Verify the shield and separate the cable from power leads. If everything checks out, replace the SPM or its control PCB." },
+    ],
+    source:"B-65285EN §3.4.56 (→ §3.4.45), B-64115EN App.A" },
+
+  { key:"sp9085", codes:["9085","SP9085"], title:"Spindle Sensor 1-Rot Signal Position Error",
+    desc:"Spindle-sensor one-rotation signal in the wrong location — SPM shows '85'. Same diagnosis as alarm 81, on the spindle sensor",
+    type:"SP", severity:"high",
+    summary:"Identical troubleshooting to alarm 81, applied to the spindle sensor: gear-ratio parameters and slip if using the external signal; otherwise sensor parameters, adjustment, shielding, routing, then the amp.",
+    context:"The manual refers alarm 85 to the alarm-81 procedure, with the spindle-end sensor as the subject.",
+    steps:[
+      { title:"Check gear-ratio parameters (4171–4174) and slip",
+        detail:"With an external one-rotation signal: verify the gear-ratio parameters and confirm no spindle-to-motor slippage (not applicable to V-belt drives)." },
+      { title:"Check sensor parameters and adjustment",
+        detail:"Check the sensor-setting parameters (B-65280EN); adjust the sensor, replacing cable and sensor if it won't adjust." },
+      { title:"Check shielding and routing; then the SPM",
+        detail:"Check the cable shield, separate from power leads, and if all is good replace the SPM or its control PCB." },
+    ],
+    source:"B-65285EN §3.4.57 (→ §3.4.53), B-64115EN App.A" },
+
+  { key:"sp9086", codes:["9086","SP9086"], title:"Spindle Sensor 1-Rot Signal Not Detected",
+    desc:"No one-rotation signal from the spindle sensor — SPM shows '86'. Same diagnosis as alarm 82, on the spindle sensor",
+    type:"SP", severity:"high",
+    summary:"Identical troubleshooting to alarm 82, applied to the spindle sensor: parameters → sensor adjustment → external signal at EXTSC1 → amp.",
+    context:"The manual refers alarm 86 to the alarm-82 procedure, with the spindle-end sensor as the subject.",
+    steps:[
+      { title:"Check sensor parameters",
+        detail:"Verify the spindle-sensor setting parameters per B-65280EN." },
+      { title:"Adjust the sensor",
+        detail:"Adjust the sensor signal; if it can't be adjusted or isn't observed, replace the connection cable and sensor." },
+      { title:"External signal — probe EXTSC1",
+        detail:"Check pin EXTSC1 on the spindle check board for one pulse per rotation; if absent, replace the cable and position coder." },
+      { title:"Replace the SPM",
+        detail:"If all checks pass, replace the SPM or its control PCB." },
+    ],
+    source:"B-65285EN §3.4.58 (→ §3.4.54), B-64115EN App.A" },
+
+  { key:"sp9087", codes:["9087","SP9087"], title:"Spindle Sensor Signal Error",
+    desc:"Spindle-sensor signal abnormal (pulse count out of range) — SPM shows '87'. Same diagnosis as alarm 83, on the spindle sensor",
+    type:"SP", severity:"high",
+    summary:"Identical troubleshooting to alarm 83, applied to the spindle sensor: cable movement → broken conductor/coolant; otherwise parameters, adjustment, shielding, routing, then the amp.",
+    context:"The manual refers alarm 87 to the alarm-83 procedure, with the spindle-end sensor as the subject.",
+    steps:[
+      { title:"Fires when the cable moves — replace the cable",
+        detail:"Broken conductor in the moving run — replace the cable. Clean coolant out of the connector." },
+      { title:"Check parameters and sensor adjustment",
+        detail:"Verify sensor parameters (B-65280EN) and adjust the sensor, replacing cable and sensor if it won't adjust." },
+      { title:"Check shielding and routing; then the SPM",
+        detail:"Check the shield per B-65282EN, separate from power leads; if all good, replace the SPM or its control PCB." },
+    ],
+    source:"B-65285EN §3.4.59 (→ §3.4.55), B-64115EN App.A" },
+
+  { key:"sp9088", codes:["9088","SP9088"], title:"SPM Radiator Fan Stopped",
+    desc:"The heat-sink (radiator) cooling fan of the Spindle Amplifier is not running — SPM shows '88'",
+    type:"SP", severity:"high",
+    summary:"The SPM's heat-sink cooling fan stopped. The documented fix is replacing that fan. (Distinct from '56', which is the control-circuit fan behind the faceplate.)",
+    context:"This is the external radiator fan that cools the SPM power stage — not the internal control-circuit fan ('56') and not a converter fan ('59'/'b3'). Fans are consumables; keep spares.",
+    steps:[
+      { title:"Confirm which fan: heat-sink, not faceplate",
+        detail:"'88' = the heat-sink (radiator) cooling fan on the SPM power section. Verify visually whether it spins at power-on." },
+      { title:"Check for obstruction and connector seating",
+        detail:"Clear chips/dust from the blades and confirm the fan connector is seated before condemning the fan." },
+      { title:"Replace the heat-sink cooling fan",
+        detail:"Replace the SPM heat-sink cooling fan per the fan-replacement procedure (B-65285EN §4.1). If a new fan still alarms, the fan-detection circuit in the SPM is faulty — replace the SPM." },
+    ],
+    source:"B-65285EN §3.4.60, B-64115EN App.A" },
+
+  { key:"sp9089", codes:["9089","SP9089"], title:"Sub-Module SM (SSM) Error (BiS)",
+    desc:"The submodule SM is abnormal — BiS series (synchronous) spindle motors only. SPM shows '89'. Check JYA4↔CX31 cable",
+    type:"SP", severity:"high",
+    summary:"BiS synchronous-motor systems only. The SSM submodule or its link to the SPM failed. At first start all four causes apply; on a previously-good machine it's the interface cable or the SSM itself.",
+    context:"The SSM connects to the Spindle Amplifier via an interface cable from JYA4 (SPM) to CX31 (SSM). The manual: at start-up, causes (a)–(d); after normal operation, only (c) and (d) — the cable link or a failed SSM.",
+    steps:[
+      { title:"Check the JYA4 ↔ CX31 interface cable",
+        detail:"Verify the interface signal cable between JYA4 on the Spindle Amplifier and CX31 on the SSM is connected and sound at both ends. This covers both 'not connected' and 'disconnected' causes." },
+      { title:"First start-up — confirm the SPM supports SSM",
+        detail:"If this is a new installation, the Spindle Amplifier model may not support the SSM — if so, replace the SPM with a supporting model." },
+      { title:"Replace the SSM",
+        detail:"If the cable is good (and the amp supports SSM), the submodule itself is faulty — replace the SSM." },
+    ],
+    source:"B-65285EN §3.4.61, B-64115EN App.A" },
+
+  { key:"sp9090", codes:["9090","SP9090"], title:"Unexpected Rotation Alarm (BiS)",
+    desc:"Torque-command polarity disagrees with acceleration — BiS series (synchronous) motors only. SPM shows '90'. AMR offset is the key parameter",
+    type:"SP", severity:"high",
+    summary:"The synchronous motor accelerated opposite to its torque command — the drive has lost track of the rotor pole. At start-up: sensor/phase parameters or AMR offset (4084/4085). After a crash or on a good machine: sensor/rotor slip or noise.",
+    context:"On BiS motors the AMR offset (No. 4084) ties the rotor's magnetic 0° to the sensor's one-rotation signal. If that relationship shifts — sensor replaced, shaft slipped, parameters copied from another machine — torque polarity goes wrong. No. 4085 is the adjustment aid and must normally be 0. The manual flags 'after the spindle is banged' as a classic slip trigger.",
+    steps:[
+      { title:"Check sensor-teeth / motor-phase parameters",
+        detail:"Verify the number-of-teeth and number-of-phases parameters per B-65280EN." },
+      { title:"Check AMR offset parameters 4084 / 4085",
+        detail:"No. 4084 (AMR offset) is adjusted per machine — readjust it if the sensor was replaced, the shaft slipped, or parameters were loaded from another machine. No. 4085 must normally be 0." },
+      { title:"After a crash — suspect sensor/rotor slip",
+        detail:"If the alarm started after the spindle was banged, the phase relationship between motor sensor and rotor likely shifted from slippage. Re-establish it (readjust AMR offset after fixing the mechanical cause)." },
+      { title:"Chase noise",
+        detail:"Count errors from noise on the motor sensor also cause this — apply noise countermeasures (shielding, grounding, separation from power leads)." },
+    ],
+    source:"B-65285EN §3.4.62, B-64115EN App.A" },
+
+  { key:"sp9091", codes:["9091","SP9091"], title:"Pole Position Count Miss (BiS)",
+    desc:"Magnetic-pole position count error vs AMR offset (4084) — BiS series (synchronous) motors only. SPM shows '91'",
+    type:"SP", severity:"high",
+    summary:"The measured pole position at the one-rotation signal disagrees sharply with parameter 4084. At start-up: teeth/phase parameters. On a good machine: sensor-ring slip or noise-induced count errors.",
+    context:"The drive continuously cross-checks the pole position against the AMR offset. A large difference means either the setup is wrong or the sensor ring has physically moved (or noise corrupted the count).",
+    steps:[
+      { title:"Check sensor-teeth / motor-phase parameters",
+        detail:"Verify the number-of-teeth and number-of-phases parameters per B-65280EN — the start-up cause." },
+      { title:"Check for sensor-ring slip",
+        detail:"Inspect whether the motor sensor (ring) slips on the shaft. A slipped ring generates spurious one-rotation signals and shifts the pole count. Fix the mechanical mount, then readjust AMR offset." },
+      { title:"Apply noise countermeasures",
+        detail:"If the sensor is mechanically sound, feedback count errors from noise are the remaining cause — check shielding, grounding, and cable separation." },
+    ],
+    source:"B-65285EN §3.4.63, B-64115EN App.A" },
+
+  { key:"sp9092", codes:["9092","SP9092"], title:"Velocity-Command Overspeed",
+    desc:"Actual motor speed exceeded the overspeed level for the commanded velocity — SPM shows '92'",
+    type:"SP", severity:"high",
+    summary:"The motor ran faster than the overspeed threshold tied to its velocity command. At start-up: teeth/phase parameters, and on BiS motors the AMR offset (4084/4085). On a previously-good machine: almost always noise.",
+    context:"The drive compares actual speed against a limit derived from the command. Wrong sensor scaling makes real speed read wrong; on synchronous motors a wrong AMR offset causes real overspeed. The manual says on a machine that ran fine, noise is the most likely cause.",
+    steps:[
+      { title:"Check sensor-teeth / motor-phase parameters",
+        detail:"Verify the number-of-teeth and number-of-phases parameters per B-65280EN — wrong scaling misreads speed." },
+      { title:"BiS motor — check AMR offset 4084 / 4085",
+        detail:"Readjust No. 4084 if the sensor/shaft relationship changed or parameters came from another machine; No. 4085 must normally be 0." },
+      { title:"Ran fine before — chase noise",
+        detail:"Count errors in the motor sensor from noise are the prime suspect on a previously-good machine. Check shielding, grounding, and routing." },
+    ],
+    source:"B-65285EN §3.4.64, B-64115EN App.A" },
+
+  // ── COMMUNICATION / OPTION-FUNCTION SPINDLE ALARMS (C0–E1) ─────────
+  { key:"sp9120", codes:["9120","9121","9122","SP9120","SP9121","SP9122"], title:"CNC↔SP Communication Data Alarm",
+    desc:"Error in serial communication data between CNC and Spindle Amplifier — SPM shows C0, C1, or C2",
+    type:"SP", severity:"high",
+    summary:"The serial-spindle data link between the CNC and the SP corrupted data (C0/C1/C2 on the amp). It's one of the two ends: the Spindle Amplifier or the CNC's serial-spindle board/module.",
+    context:"9120/9121/9122 map to amp codes C0/C1/C2 — all the same fault class: serial communication data errors on the CNC↔SP link. The manual gives two hardware suspects; check the obvious cable/connector condition on the way.",
+    steps:[
+      { title:"Inspect the serial spindle cable and connectors",
+        detail:"Before swapping boards, check the JA7B/JA41 serial link cable and connectors for damage or looseness — data corruption often starts at a bad connector.",
+        note:"Route the serial cable away from power wiring; induced noise corrupts data intermittently." },
+      { title:"Replace the SPM or its control PCB",
+        detail:"The manual's first suspect: a defective Spindle Amplifier. Replace the SPM or its control printed-circuit board." },
+      { title:"Replace the CNC serial-spindle board/module",
+        detail:"If the amp swap doesn't clear it, the CNC side is defective — replace the board or module related to the serial spindle." },
+    ],
+    source:"B-65285EN §3.4.67, B-64115EN App.A" },
+
+  { key:"sp9123", codes:["9123","SP9123"], title:"Spindle Switching Circuit Error",
+    desc:"Mismatch between the switching request (SPSL) and the switching-circuit status — SPM shows C3. Submodule SW (SSW) defective",
+    type:"SP", severity:"high",
+    summary:"On spindle-switching systems, the SPSL request signal and the actual state of the motor/spindle sensor switching circuit (submodule SW) disagree. The documented fix: replace the SSW.",
+    context:"Spindle switching routes one amplifier between two motors/sensor sets through the submodule SW. When the commanded state and the SSW's internal state mismatch, C3 fires.",
+    steps:[
+      { title:"Replace the submodule SW (SSW)",
+        detail:"The manual's direct action: the SSW is defective — replace it. Verify the SPSL sequence timing from the PMC only if a new SSW reproduces the fault." },
+    ],
+    source:"B-65285EN §3.4.68, B-64115EN App.A" },
+
+  { key:"sp9124", codes:["9124","SP9124"], title:"Invalid Learning-Control Velocity Command",
+    desc:"Invalid learning cycle set in time-synchronization learning control — SPM shows C4. Check the command and parameter 4425",
+    type:"SP", severity:"med",
+    summary:"Learning-control setup problem, not hardware. The velocity command or the learning cycle (parameter 4425) is out of range for time-sync learning control.",
+    context:"Learning control (time synchronization mode) needs a valid velocity command and a learning cycle within limits. Parameter 4425 must be between 20 and 4800.",
+    steps:[
+      { title:"Check the velocity command value",
+        detail:"Verify the value specified in the velocity command is appropriate for learning control in time-synchronization mode." },
+      { title:"Check parameter 4425 range (20–4800)",
+        detail:"Confirm the learning-cycle setting in parameter No. 4425 is within 20 to 4800. Correct it if outside." },
+    ],
+    source:"B-65285EN §3.4.69, B-64115EN App.A" },
+
+  { key:"sp9125", codes:["9125","SP9125"], title:"Invalid Dynamic-Compensation Degree",
+    desc:"Invalid highest/lowest degree of the dynamic characteristic compensation element in learning control — SPM shows C5",
+    type:"SP", severity:"med",
+    summary:"Learning-control parameter problem. The dynamic-characteristic compensation degrees (parameters 4427/4428) are set to invalid values — decrease them.",
+    context:"Learning control's compensation element Gx has a highest degree (No. 4427) and lowest degree (No. 4428). An invalid combination raises C5.",
+    steps:[
+      { title:"Decrease parameter 4427 / 4428",
+        detail:"Lower the setting of the highest (No. 4427) or lowest (No. 4428) degree of dynamic characteristic compensation element Gx until the alarm clears." },
+    ],
+    source:"B-65285EN §3.4.70, B-64115EN App.A" },
+
+  { key:"sp9127", codes:["9127","SP9127"], title:"Invalid Learning Cycle (Angle Sync)",
+    desc:"Invalid reference-angle cycle in angle-synchronization learning control — SPM shows C7. Increase parameter 4425",
+    type:"SP", severity:"med",
+    summary:"Learning-control parameter problem. In angle-synchronization mode the reference angle cycle is invalid — increase the number of divisions per cycle (parameter 4425).",
+    context:"Angle-sync learning control divides the cycle by parameter No. 4425. Too few divisions makes the cycle invalid.",
+    steps:[
+      { title:"Increase parameter 4425",
+        detail:"Raise the setting of parameter No. 4425 (number of divisions per cycle) for learning control until the cycle is valid." },
+    ],
+    source:"B-65285EN §3.4.71, B-64115EN App.A" },
+
+  { key:"sp9128", codes:["9128","SP9128"], title:"Spindle Sync: Excessive Speed Deviation",
+    desc:"Speed deviation in spindle synchronization exceeded the detection level (parameter 4515) — SPM shows C8",
+    type:"SP", severity:"high",
+    summary:"During spindle synchronization the speed deviation passed the limit in parameter 4515. Right after excitation off/on → a sequence problem (accumulated position error). During cutting → overload, or a too-tight detection level.",
+    context:"The drive compares the spindle-end speed implied by position error and gain against actual speed. The manual's key insight: if excitation (SFR/SRV) is switched off and back on while sync is active, the motor lunges to catch up the accumulated error and trips C8 — that's a sequence bug, not a fault.",
+    steps:[
+      { title:"Fires right after excitation off/on — fix the sequence",
+        detail:"If SFR/SRV is turned off then on during spindle synchronization, the motor accelerates to eliminate accumulated position error and trips the alarm. Modify the PMC/program sequence so motor excitation is turned off only AFTER spindle synchronization is released." },
+      { title:"Fires during cutting — review the load",
+        detail:"Overload is the likely cause — review the cutting conditions (depth, feed, tooling) on the synchronized operation." },
+      { title:"No overload — review the detection level",
+        detail:"If cutting conditions are reasonable, check whether the alarm detection level in parameter No. 4515 is set appropriately for this machine." },
+    ],
+    source:"B-65285EN §3.4.72, B-64115EN App.A" },
+
+  { key:"sp9129", codes:["9129","SP9129"], title:"Spindle Sync: Excessive Position Error",
+    desc:"Position error in spindle synchronization exceeded the detection level (parameter 4516) — SPM shows C9. Same diagnosis as C8",
+    type:"SP", severity:"high",
+    summary:"Same fault family as C8 but on position error vs parameter 4516. Work it exactly like C8: excitation-sequence first, then load, then the detection level.",
+    context:"The manual refers C9 troubleshooting to the C8 subsection — same causes, different measured quantity (position error, limit in No. 4516).",
+    steps:[
+      { title:"Fires after excitation off/on — fix the sequence",
+        detail:"Turn motor excitation off only after spindle synchronization is released — otherwise the catch-up move trips the alarm." },
+      { title:"Fires during cutting — review load, then level",
+        detail:"Suspect overload first and review cutting conditions; if no overload, review the detection level in parameter No. 4516." },
+    ],
+    source:"B-65285EN §3.4.73 (→ §3.4.72), B-64115EN App.A" },
+
+  { key:"sp9130", codes:["9130","SP9130"], title:"Tandem: Speed Polarity Error",
+    desc:"In torque tandem control, master/slave speed polarity relationship is abnormal — SPM shows d0. Check rotation-direction setting",
+    type:"SP", severity:"high",
+    summary:"On a torque-tandem spindle pair, the master and slave motors' speed polarities disagree. Check the rotation-direction setting (FS16: bit 2 of parameter 4353).",
+    context:"Tandem control drives one spindle with two motors sharing torque. Their rotation-direction configuration must match the mechanical arrangement, or the polarity check fails.",
+    steps:[
+      { title:"Check the rotation-direction setting",
+        detail:"Verify the setting related to rotation direction — on FS16 systems, bit 2 of parameter No. 4353 — matches the actual master/slave mechanical arrangement." },
+    ],
+    source:"B-65285EN §3.4.74, B-64115EN App.A" },
+
+  { key:"sp9131", codes:["9131","SP9131"], title:"Spindle Adjustment Function Alarm",
+    desc:"An error occurred during spindle-adjustment-function operation — SPM shows d1. See SERVO GUIDE for the specific error",
+    type:"SP", severity:"med",
+    summary:"The automatic spindle adjustment function hit an error. The specific description and action are shown in SERVO GUIDE — read it there.",
+    context:"This alarm belongs to the SERVO GUIDE spindle-adjustment feature; the tool itself displays the error detail and the action to take.",
+    steps:[
+      { title:"Read the error on SERVO GUIDE",
+        detail:"Open SERVO GUIDE and refer to the description of the error and the action displayed for this adjustment run — the fix is specific to what the tool reports." },
+    ],
+    source:"B-65285EN §3.4.75, B-64115EN App.A" },
+
+  { key:"sp9132", codes:["9132","SP9132"], title:"Serial Sensor Communication Lost",
+    desc:"Communication between the serial sensor and the SP is disconnected — SPM shows d2",
+    type:"SP", severity:"high",
+    summary:"The serial (digital) spindle sensor stopped talking to the amplifier. At start-up: parameters or an unsupported amp. On a previously-good machine: the cable or the amp.",
+    context:"Serial sensors carry position data digitally. The manual: at first start, causes (a)–(d) all apply; after normal operation, only the cable/connection (c) or a defective amp (d).",
+    steps:[
+      { title:"Check the sensor-setting parameters",
+        detail:"Check the sensor parameters per the START-UP section of B-65280EN — a wrong sensor type kills the serial link from the start." },
+      { title:"First start-up — confirm the SPM supports this sensor",
+        detail:"Check 'PARAMETERS RELATED TO DETECTORS' in B-65282EN — the amplifier must support the serial sensor in use." },
+      { title:"Check / replace the cable",
+        detail:"A broken or mis-connected cable is the common cause on a machine that ran fine. Check the connection; replace the cable." },
+      { title:"Replace the SPM",
+        detail:"If parameters, support, and cable are good, replace the Spindle Amplifier or its control PCB." },
+    ],
+    source:"B-65285EN §3.4.76, B-64115EN App.A" },
+
+  { key:"sp9133", codes:["9133","SP9133"], title:"Serial Sensor Data Error (Noise)",
+    desc:"Serial data from the sensor was corrupted by noise on receipt — SPM shows d3. Check the cable shielding",
+    type:"SP", severity:"high",
+    summary:"The amp received serial-sensor data destroyed by noise. The documented action: check the shielding of the sensor-to-SP cable.",
+    context:"Corrupted-in-flight data is a shielding/grounding problem, not a sensor failure. The manual points at the cable shield per the 'Detectors' section of B-65282EN.",
+    steps:[
+      { title:"Check the cable shielding",
+        detail:"Inspect the shield of the cable between the serial sensor and the Spindle Amplifier per B-65282EN 'Detectors' — continuity, termination, and grounding." },
+      { title:"Check routing",
+        detail:"Separate the sensor cable from motor power leads and other noise sources; re-route if bundled.",
+        note:"If d3 appears only during heavy cutting or when a specific axis moves, suspect coupling from that axis's power cable — walk the cable run." },
+    ],
+    source:"B-65285EN §3.4.77, B-64115EN App.A" },
+
+  { key:"sp9134", codes:["9134","SP9134"], title:"Serial Sensor Soft Phase Alarm",
+    desc:"Position data from the serial sensor changed beyond the expected range — SPM shows d4",
+    type:"SP", severity:"high",
+    summary:"The serial sensor's position data jumped more than physically plausible. At start-up: parameter error. On a previously-good machine: cable shielding.",
+    context:"A position jump beyond the expected range means bad scaling (parameters) or corrupted data (shielding). The manual: at start, (a) and (b); after normal operation, (b) only.",
+    steps:[
+      { title:"Check the sensor-setting parameters",
+        detail:"Check the sensor parameters per 'Parameters Related to Start-up' in B-65280EN." },
+      { title:"Check the cable shielding",
+        detail:"Check the shield of the serial-sensor-to-SP cable per B-65282EN 'Detectors' — the cause on machines that ran fine before." },
+    ],
+    source:"B-65285EN §3.4.78, B-64115EN App.A" },
+
+  { key:"sp9137", codes:["9137","SP9137"], title:"SPM Device Communication Error",
+    desc:"Communication error in an electronic device on the SP control circuit — SPM shows d7. Usually a loose control PCB",
+    type:"SP", severity:"high",
+    summary:"An on-board device on the SPM control circuit lost communication. The manual's cause: the control PCB is loose, or the amplifier is abnormal. Seat the board first.",
+    context:"Internal to the amplifier — a mounting/contact problem before it's a component failure.",
+    steps:[
+      { title:"Check the control PCB mounting",
+        detail:"Power off and check whether the Spindle Amplifier control printed-circuit board is mounted correctly — push the faceplate fully home and verify its connectors are engaged." },
+      { title:"Replace the SPM",
+        detail:"If the board is mounted correctly and d7 persists, the amplifier is abnormal — replace the Spindle Amplifier." },
+    ],
+    source:"B-65285EN §3.4.79, B-64115EN App.A" },
+
+  { key:"sp9139", codes:["9139","SP9139"], title:"Serial Sensor Internal Circuit Error",
+    desc:"An error occurred in the inner circuit of the serial sensor — SPM shows d9. Replace the detection circuit",
+    type:"SP", severity:"high",
+    summary:"The serial sensor's own detection circuit failed. The documented fix: replace the detection circuit (sensor).",
+    context:"This is inside the sensor, not the cable or the amp.",
+    steps:[
+      { title:"Replace the detection circuit",
+        detail:"The sensor's internal detection circuit is abnormal — replace the detection circuit (the sensor unit)." },
+    ],
+    source:"B-65285EN §3.4.80, B-64115EN App.A" },
+
+  { key:"sp9140", codes:["9140","SP9140"], title:"Serial Sensor Pulse Count Error",
+    desc:"Pulse count between one-rotation signals of the serial sensor is out of range — SPM shows E0. Replace the detection circuit",
+    type:"SP", severity:"high",
+    summary:"The serial sensor's pulses-per-revolution count came up wrong. The documented fix: replace the detection circuit.",
+    context:"Like d9, this points inside the sensor's detection circuit.",
+    steps:[
+      { title:"Replace the detection circuit",
+        detail:"The detection circuit is abnormal — replace it (the sensor unit)." },
+    ],
+    source:"B-65285EN §3.4.81, B-64115EN App.A" },
+
+  { key:"sp9141", codes:["9141","SP9141"], title:"Serial Sensor 1-Rot Signal Not Detected",
+    desc:"No one-rotation signal from the serial sensor within five rotations after power-on — SPM shows E1",
+    type:"SP", severity:"high",
+    summary:"The serial sensor never produced its one-rotation signal in the first five revolutions. At start-up: sensor parameters (wrong teeth count), then adjustment, then the detection circuit. On a good machine: adjustment or the circuit.",
+    context:"With a wrong number-of-teeth setting, the amp's calculated rotation count never matches reality, so the signal seems missing. The manual: at start, (a)–(c); after normal operation, (b) and (c).",
+    steps:[
+      { title:"Check the sensor-setting parameters",
+        detail:"An invalid number-of-teeth setting causes this — check the sensor parameters per 'Parameters Related to Start-up' in B-65280EN." },
+      { title:"Adjust the sensor signal",
+        detail:"Adjust the sensor per B-65282EN 'Detectors'. If it can't be brought into spec, move to replacement." },
+      { title:"Replace the detection circuit",
+        detail:"If parameters and adjustment are good, the detection circuit is abnormal — replace it." },
+    ],
+    source:"B-65285EN §3.4.82, B-64115EN App.A" },
+
+  // ── PMC ALARMS (B-64115EN §A.2, pp.569-580) ───────────────────────
+  // Setup/config (ER), I/O Link, ladder, memory, and system-level PMC faults.
+  { key:"pmc_er32", codes:["ER32"], title:"No I/O Device",
+    desc:"An I/O device (I/O Link, connection unit, or Power Mate) is not connected or was powered on after the CNC.",
+    type:"PMC", severity:"high",
+    summary:"The PMC cannot find an I/O device on the I/O Link.",
+    context:"The I/O Link daisy-chains the CNC to distributed I/O units, operator panels, and Power Mate drives. Every device on the link must be powered up before or with the CNC. If one is off, unplugged, or came up late, the PMC reports no I/O device.",
+    steps:[
+      { title:"Check every I/O device on the link is powered on",
+        detail:"Walk the I/O Link chain: distributed I/O modules, operator panel I/O, any Power Mate / β amplifiers on the link. All must have power." },
+      { title:"Power sequence — I/O devices before or with the CNC",
+        detail:"If an I/O device powers up after the CNC, the PMC won't see it. Power them together, or the I/O device first. If separate supplies, check the timing." },
+      { title:"Check the I/O Link cable and connectors",
+        detail:"Inspect the JD1A/JD1B optical or electrical link cable at every hop for looseness or damage. A break anywhere drops every device downstream." },
+    ],
+    source:"B-64115EN §A.2" },
+
+  { key:"pmc_er34", codes:["ER34"], title:"I/O Link Error",
+    desc:"Communication error with an I/O device in a specific link group.",
+    type:"PMC", severity:"high",
+    summary:"A slave in one I/O Link group failed to communicate.",
+    context:"ER34 names the group number (xx) where communication failed. It points at one specific segment of the link rather than the whole chain.",
+    steps:[
+      { title:"Check the cable to the named group",
+        detail:"The alarm shows the group number. Check the link cable leading into that group's device for looseness or damage." },
+      { title:"Confirm that device powered on before the CNC",
+        detail:"A late-starting device in the group triggers this. Verify its power sequence." },
+      { title:"Replace the device holding the PMC control module in that group",
+        detail:"If cable and power are good, the I/O device in the named group that carries the PMC control module has likely failed." },
+    ],
+    source:"B-64115EN §A.2" },
+
+  { key:"pmc_er01", codes:["ER01"], title:"PMC Program Data Error",
+    desc:"The sequence program (ladder) is invalid.",
+    type:"PMC", severity:"high",
+    summary:"The PMC ladder program data is corrupt or invalid.",
+    context:"The stored sequence program failed its validity check. Usually a corrupted ladder or a memory fault on the master board.",
+    steps:[
+      { title:"Re-input the sequence program",
+        detail:"Reload the correct ladder program for this machine from backup." },
+      { title:"Replace the master printed circuit board",
+        detail:"If a known-good ladder still throws ER01, the master board memory is faulty." },
+    ],
+    source:"B-64115EN §A.2" },
+
+  { key:"pmc_er09", codes:["ER09"], title:"PMC Label Check Error",
+    desc:"PMC retention memory needs initialization (typically after a PMC type change).",
+    type:"PMC", severity:"med",
+    summary:"The PMC's retention-type memory must be cleared/initialized.",
+    context:"When the PMC type changes, the retention memory layout no longer matches and must be re-initialized. The alarm text tells you the key combination to clear it.",
+    steps:[
+      { title:"Power on holding 'O' and 'Z' to clear PMC SRAM",
+        detail:"Turn the CNC off, then power on while holding the 'O' and 'Z' keys. With loader control, use '5' and 'Z' instead." },
+      { title:"Replace the backup battery",
+        detail:"If the error keeps returning, the memory backup battery may be dead — replace it." },
+      { title:"Replace the master printed circuit board",
+        detail:"If clearing and a fresh battery don't hold, the master board is at fault." },
+    ],
+    source:"B-64115EN §A.2" },
+
+  { key:"pmc_er02", codes:["ER02","ER03"], title:"PMC Program Size Over",
+    desc:"The sequence program is too large for the installed ladder-step option.",
+    type:"PMC", severity:"med",
+    summary:"The ladder exceeds the number-of-steps option.",
+    context:"The loaded ladder is larger than the purchased ladder-step allowance.",
+    steps:[
+      { title:"Reduce the sequence program size",
+        detail:"Trim the ladder to fit the current step option." },
+      { title:"Purchase a larger ladder-step option from FANUC",
+        detail:"If the ladder is needed as-is, contact FANUC to specify a larger number-of-ladder-steps option." },
+    ],
+    source:"B-64115EN §A.2" },
+
+  { key:"pmc_950", codes:["950"], title:"PMC System Alarm",
+    desc:"A fatal error occurred in the PMC (PCxxx code shown).",
+    type:"PMC", severity:"high",
+    summary:"PMC system alarm — see the PCxxx code in the message.",
+    context:"A serious PMC fault. The PCxxx suffix identifies the internal error; most point to the master/motherboard.",
+    steps:[
+      { title:"Record the full PCxxx code and message",
+        detail:"Note the exact PCxxx number and any hex data shown — FANUC needs it if the board must be diagnosed." },
+      { title:"Power cycle and see if it recurs",
+        detail:"A one-time transient can be cleared by a full power cycle. A repeating 950 is a hardware fault." },
+      { title:"Replace the master / motherboard",
+        detail:"Persistent PMC system alarms point to the main board. Replace it and confirm the alarm clears." },
+    ],
+    source:"B-64115EN §A.1 (12), §A.2" },
+
+  { key:"pmc_951", codes:["951"], title:"PMC Watchdog Alarm",
+    desc:"PMC watchdog timeout — main board may be faulty.",
+    type:"PMC", severity:"high",
+    summary:"The PMC watchdog timer expired.",
+    context:"The PMC stopped servicing its watchdog, which forces this alarm. Almost always a main board hardware issue.",
+    steps:[
+      { title:"Power cycle the CNC",
+        detail:"Rule out a transient. Turn everything off, wait, and restart." },
+      { title:"Replace the main board",
+        detail:"A recurring watchdog alarm indicates a main board fault." },
+    ],
+    source:"B-64115EN §A.1 (12)" },
+
+  { key:"pmc_971", codes:["971"], title:"NMI in SLC — I/O Link Disconnected",
+    desc:"An I/O Link disconnection was detected (non-maskable interrupt).",
+    type:"PMC", severity:"high",
+    summary:"The I/O Link dropped out during operation.",
+    context:"The link was lost while running — a cable or a downstream device went away. Different from ER32/ER34 in that it fired as an NMI during operation.",
+    steps:[
+      { title:"Check the I/O Link for a disconnection",
+        detail:"Inspect the whole link chain — a cable pulled loose, a device that lost power, or a failed hop." },
+      { title:"Check each device's power stability",
+        detail:"A device that browns out under load can drop the link. Verify supply voltage at each device." },
+    ],
+    source:"B-64115EN §A.1 (12)" },
+
+  // ── CNC SYSTEM ALARMS (B-64115EN Ch.8) ────────────────────────────
+  // Fatal control-unit faults shown on the SYSTEM ALARM screen. Mostly
+  // board-level: isolate by swapping cards in the documented order.
+  { key:"sys900", codes:["900","SYS900"], title:"ROM Parity",
+    desc:"A parity error was detected in the FROM (flash ROM) that stores the CNC software",
+    type:"SYS", severity:"high",
+    summary:"The CNC found a parity error in the flash-ROM area holding its software. Reload the software; if that doesn't hold, the FROM/SRAM module or main board is failing.",
+    context:"Alarm 900 means the stored system software failed its parity check. It can come from a bad software write/update, a marginal FROM/SRAM module, or a failing main board. Work it software-first, then hardware.",
+    steps:[
+      { title:"Reload / rewrite the software component",
+        detail:"Using the boot system, re-write the CNC software component from a known-good backup. A corrupted or partially-written software module is the first and cheapest cause to rule out." },
+      { title:"Replace the FROM/SRAM module",
+        detail:"If a clean re-write still throws 900, the FROM/SRAM module (where the software lives) is suspect. Back up SRAM first, replace the module, then restore all software and data." },
+      { title:"Replace the main board",
+        detail:"If a new FROM/SRAM module doesn't clear it, replace the main board. See §2.4 of the manual for card/module locations." },
+    ],
+    source:"B-64115EN §8.25" },
+
+  { key:"sys912", codes:["912","913","914","915","916","917","918","919","SYS912"], title:"DRAM Parity (912–919)",
+    desc:"A parity error occurred in the DRAM that runs the CNC software — the DRAM sits on the CPU card",
+    type:"SYS", severity:"high",
+    summary:"At power-on the CNC copies its software from FROM into DRAM and runs it there. A parity error was detected on that DRAM. The DRAM is mounted on the CPU card — external noise or a bad CPU card is the cause.",
+    context:"Alarms 912 through 919 all flag a DRAM parity error. The DRAM is part of the CPU card, so the fix is card-level. External noise can corrupt DRAM data, so if it clears on a power cycle, look at the noise environment before condemning hardware.",
+    steps:[
+      { title:"Power off/on and watch for recurrence",
+        detail:"Fully power-cycle the CNC. If 912–919 clears and stays gone, the data was likely corrupted by an external cause (noise) rather than failed silicon — review the noise environment (grounding, cable routing, nearby switching gear)." },
+      { title:"Replace the CPU card",
+        detail:"A repeating DRAM parity alarm points to the CPU card, which carries the DRAM. Replace it. NOTE: on basic units A02B-0309-B52n / A02B-0311-B52n / A02B-0311-B53n, 'CPU card' means the main board — replace the main board instead." },
+    ],
+    source:"B-64115EN §8.26" },
+
+  { key:"sys920", codes:["920","921","SYS920"], title:"Servo Watchdog / Axis-Card Alarm",
+    desc:"A watchdog or RAM-parity error occurred in the axis-control-card circuit (920 = axes 1–4)",
+    type:"SYS", severity:"high",
+    summary:"The servo control circuit on the axis control card hit a watchdog timeout or a RAM parity error. Alarm 920 covers axes 1–4. Suspect the optical (FSSB) cable, the axis control card, the CPU card, or the motherboard.",
+    context:"The servo control circuit watches the main CPU; if the CPU or its peripheral circuit faults and the watchdog timer isn't reset, a watchdog error is raised. A RAM parity error on the axis card does the same. It's a hardware-isolation job — swap in the documented order.",
+    steps:[
+      { title:"Replace the optical (FSSB) cable",
+        detail:"A defective FSSB optical cable between the CNC and the amplifiers can trigger 920. It's the cheapest part in the chain — replace it first." },
+      { title:"Replace the axis control card",
+        detail:"If a new optical cable doesn't clear it, replace the axis control card carrying the servo control circuit for the affected axes." },
+      { title:"Replace the CPU card",
+        detail:"Still alarming? Replace the CPU card — a fault in the main CPU or its peripherals can stop the watchdog from being serviced." },
+      { title:"Replace the main board",
+        detail:"If none of the above solves it, replace the main board. See §2.4 for card locations." },
+    ],
+    source:"B-64115EN §8.27" },
+
+  { key:"sys926", codes:["926","SYS926"], title:"FSSB Alarm",
+    desc:"A fault occurred on the FSSB (serial servo bus) linking the servo amplifiers to the CNC",
+    type:"SYS", severity:"high",
+    summary:"The FSSB — the fiber-optic serial bus tying the servo amps to the CNC — reported a fault. Read the amplifier 7-segment LEDs and the on-screen MODE/STATUS data to pin down which link or unit is bad. A power fault inside an amplifier also raises this.",
+    context:"926 fires when any element of the FSSB chain (axis control card, optical cable, or a servo amplifier) fails. The CNC gives you two diagnostic tools: the 7-seg LEDs on each amp, and MODE/STATUS bit data at the bottom of the screen. Note a subtle cause — an amplifier control-power drop or a grounded +5 V pulsecoder conductor shows up here as an FSSB alarm.",
+    steps:[
+      { title:"Read the amplifier 7-segment LEDs along the chain",
+        detail:"Walk the FSSB chain and read each amp's LED. A break shows as an 'L' or '–' on one side and 'U' on the amps downstream of the fault — the bad optical cable (or one of the two amps it joins) sits at that boundary. An amp nearest the CNC showing '–'/'U' points at the CNC-side optical cable or the axis control card." },
+      { title:"Read the MODE / STATUS data on screen",
+        detail:"With 926 active, the CNC shows MODE and STATUS words at the bottom of the screen. MODE bits 12–15 give the slave number where the alarm occurred (slave 0 = unit nearest the CNC). STATUS patterns A/B/C narrow it to the optical cable, a slave amplifier, or the axis control card." },
+      { title:"Check amplifier control power and pulsecoder cable",
+        detail:"An amplifier control-power undervoltage, or the +5 V conductor of a pulsecoder cable shorted to ground, produces an FSSB alarm. Check amp control power and megger/inspect the feedback cables before swapping the bus hardware." },
+      { title:"Replace the optical cable, then the axis control card",
+        detail:"Based on the LED/STATUS diagnosis, replace the implicated optical cable first. If the diagnosis points at the CNC, replace the axis control card on the main board (§2.4 for locations)." },
+    ],
+    source:"B-64115EN §8.28" },
+
+  { key:"sys930", codes:["930","SYS930"], title:"CPU Interrupt",
+    desc:"An interrupt that can never occur in normal operation was generated — likely CPU-peripheral fault or noise",
+    type:"SYS", severity:"high",
+    summary:"The CPU took an interrupt that should never happen in normal running. The exact cause can't be identified, but it points at the CPU's peripheral circuit — or, if a power cycle clears it, at electrical noise.",
+    context:"930 is a catch-all CPU fault. Because the cause isn't precisely identifiable, the strategy is: rule out noise with a power cycle, then swap the CPU card and main board.",
+    steps:[
+      { title:"Power off/on — does it clear?",
+        detail:"Fully power-cycle the CNC. If 930 goes away and stays gone, the fault was most likely noise-induced. Move to the noise-environment check rather than swapping boards." },
+      { title:"Examine the noise environment",
+        detail:"Review grounding, shield terminations, and cable routing; look for nearby contactors, VFDs, or welders coupling noise into the control. Follow the manual's anti-noise measures." },
+      { title:"Replace the CPU card, then the main board",
+        detail:"If it recurs regardless of power cycling, the fault is in the CPU peripheral circuit. Replace the CPU card; if unresolved, replace the main board (§2.4 for locations)." },
+    ],
+    source:"B-64115EN §8.29" },
+
+  { key:"sys935", codes:["935","SYS935"], title:"SRAM ECC Error",
+    desc:"A multi-bit ECC error occurred in the SRAM holding parameters and machining programs — check the battery first",
+    type:"SYS", severity:"high",
+    summary:"The SRAM that stores your parameters and programs threw a 2-bit (uncorrectable) ECC error. Single-bit errors self-correct; this one couldn't. Most common cause is a run-down memory-backup battery — check it before anything else.",
+    context:"The SRAM uses ECC: 8 correction bits per 16 data bits, so any single-bit error is fixed automatically and operation continues. 935 fires only when two or more bits are wrong. The usual trigger is a dead backup battery (rated 3 V; 'BAT' flashes at 2.6 V) letting SRAM data decay — but external noise or a failing FROM/SRAM module or main board can also do it.",
+    steps:[
+      { title:"Check the memory-backup battery",
+        detail:"The SRAM backup battery is rated 3 V; the CNC flashes 'BAT' when it falls to 2.6 V. If a battery alarm is or was present, replace the battery promptly — a run-down battery is the most common cause of 935.",
+        warn:"Replace the backup battery with the CNC powered ON where possible, so SRAM contents aren't lost during the swap." },
+      { title:"Restore data — memory all-clear or backup",
+        detail:"With a good battery, perform a memory all-clear and start up, then reload parameters/programs. If you have a SRAM backup (boot system), restore from it instead of clearing and re-entering by hand." },
+      { title:"Replace the FROM/SRAM module",
+        detail:"If all-clear/restore doesn't hold, the FROM/SRAM module is failing. Back up first, replace the module, then restore all software and data — everything must be reloaded after the swap." },
+      { title:"Replace the main board",
+        detail:"If a new FROM/SRAM module still throws 935, replace the main board (§2.4 for locations)." },
+    ],
+    source:"B-64115EN §8.30" },
+
+  { key:"sys972", codes:["972","SYS972"], title:"NMI on an Option Board",
+    desc:"A non-maskable interrupt (error) was detected on an option board, not the main board — the SLOT number names it",
+    type:"SYS", severity:"high",
+    summary:"An error was flagged on an option board rather than the main board. The screen shows the SLOT number of the offending board (or the alarm number that occurred on it). Act on that board. (Series 0i-C only.)",
+    context:"972 tells you the fault is on a plugged-in option board, and gives you a SLOT number to find it: 'NMI OCCURRED IN OTHER MODULE — SLOT n'. The SLOT field is either the physical slot of the option board or the number of the alarm that occurred on it.",
+    steps:[
+      { title:"Read the SLOT number on the SYSTEM ALARM screen",
+        detail:"Note the SLOT value shown under '972 NMI OCCURRED IN OTHER MODULE'. It identifies the option-board slot at fault — or the alarm number raised on that board. If it's an alarm number, take the action for that specific alarm on the option board." },
+      { title:"Replace the option board in the indicated slot",
+        detail:"Power off, and replace the option board installed in the slot the alarm named. Reseat first if you suspect a contact issue, then replace if it recurs (§2.4 for slot locations)." },
+    ],
+    source:"B-64115EN §8.33" },
+
+  { key:"sys973", codes:["973","SYS973"], title:"NMI, Unknown Cause",
+    desc:"An error that can never occur in normal operation was detected, with no identifiable cause",
+    type:"SYS", severity:"high",
+    summary:"A non-maskable interrupt fired and the CNC can't identify the cause. There's no shortcut — swap the installed boards one at a time to find the bad one.",
+    context:"973 is the 'unknown NMI' — the control knows something illegal happened but can't localize it. The manual's procedure is a methodical board swap: replace each installed PCB (cards, modules, and the back panel) one at a time until the alarm clears.",
+    steps:[
+      { title:"Power off/on to rule out a transient",
+        detail:"Fully power-cycle first. A one-time NMI from a transient may not return; a repeating 973 needs the board-swap procedure below." },
+      { title:"Swap installed boards one at a time",
+        detail:"Replace the installed PCBs one at a time — CPU card, main board, then other cards, modules, and the back panel — checking after each swap to identify which board clears the alarm (§2.4 for locations)." },
+    ],
+    source:"B-64115EN §8.34" },
+
+  { key:"sys974", codes:["974","SYS974"], title:"F-BUS Error",
+    desc:"A bus error occurred on the FANUC-BUS that connects the option boards to the main board",
+    type:"SYS", severity:"high",
+    summary:"A fault occurred during data exchange between the main board and an option board over the FANUC-BUS. Isolate by swapping the CPU card, main board, option boards, and back panel in order.",
+    context:"974 flags a bus error on the FANUC-BUS — the bus linking option boards to the main board. It means a transfer between the main board and an option board failed. Work the documented swap order.",
+    steps:[
+      { title:"Replace the CPU card on the main board",
+        detail:"Start with the CPU card. (On basic unit A02B-0309-B52n, skip straight to replacing the main board — that unit has no separate CPU card.)" },
+      { title:"Replace the main board",
+        detail:"If a new CPU card doesn't clear it, replace the main board." },
+      { title:"Replace the option boards one at a time",
+        detail:"Swap each installed option board in turn, checking after each, to find the one causing the F-BUS fault." },
+      { title:"Replace the back panel",
+        detail:"If boards don't resolve it, replace the back panel (on A02B-0309-B52n units, the power PCB). See §2.4 for locations." },
+    ],
+    source:"B-64115EN §8.35" },
+
+  { key:"sys975", codes:["975","SYS975"], title:"Bus Error (Main Board)",
+    desc:"A bus error occurred on the main board — a data-exchange fault within the main board itself",
+    type:"SYS", severity:"high",
+    summary:"A transfer within the main board failed (bus error). Isolate by swapping the CPU card, then the display-control card / axis-control cards / FROM-SRAM module, then the main board.",
+    context:"975 is a bus error internal to the main board — data exchange between components on the board went wrong. The swap order depends slightly on the basic-unit drawing number, but the sequence below matches the manual.",
+    steps:[
+      { title:"Replace the CPU card on the main board",
+        detail:"Begin with the CPU card. (On basic unit A02B-0309-B52n, go to the next step — no separate CPU card on that unit.)" },
+      { title:"Replace cards/modules one at a time",
+        detail:"Swap the display-control card, axis-control cards, and FROM/SRAM module one at a time. On A02B-0309-B52n / A02B-0311-B52n / A02B-0311-B53n units, replace the axis-control card and the FROM/SRAM module in that order." },
+      { title:"Replace the main board",
+        detail:"If no single card/module clears it, replace the main board (§2.4 for locations)." },
+    ],
+    source:"B-64115EN §8.36" },
+
+  { key:"sys976", codes:["976","SYS976"], title:"Local Bus Error (Main Board)",
+    desc:"A bus error occurred on the local bus of the main board — a data-exchange fault within the main board",
+    type:"SYS", severity:"high",
+    summary:"A transfer on the main board's local bus failed. Same isolation path as 975: CPU card, then the other cards/modules, then the main board.",
+    context:"976 is a bus error on the local bus of the main board — internal data exchange went wrong. Handle it exactly like 975, following the documented swap order.",
+    steps:[
+      { title:"Replace the CPU card on the main board",
+        detail:"Start with the CPU card. (On basic unit A02B-0309-B52n, skip to the next step.)" },
+      { title:"Replace cards/modules one at a time",
+        detail:"Swap the display-control card, axis-control cards, and FROM/SRAM module one at a time. On A02B-0309-B52n / A02B-0311-B52n / A02B-0311-B53n units, replace the axis-control card and the FROM/SRAM module in that order." },
+      { title:"Replace the main board",
+        detail:"If nothing else clears it, replace the main board (§2.4 for locations)." },
+    ],
+    source:"B-64115EN §8.37" },
+];
+
+// ── SPM AMPLIFIER ALARM CODES (shown on 2-digit 7-segment of spindle amp) ─
+// These are the codes shown on the SPM front panel, NOT CNC screen numbers.
+const SPM_ALARM_DB = [
+  { code:"01", title:"Motor Overheat",
+    desc:"Spindle motor temperature exceeded threshold. Check cooling fan, coolant system, cutting conditions, or feedback cable.",
+    steps:[
+      { title:"Check if motor is actually hot",
+        detail:"Feel the motor housing carefully. If hot → thermal overload. If cool → temperature sensor fault, skip to step 5." },
+      { title:"Check motor cooling fan / liquid cooling",
+        detail:"Fan-cooled: verify fan is running. Liquid-cooled: check coolant flow, pump, and coolant temperature." },
+      { title:"Review cutting conditions",
+        detail:"Heavy continuous cutting or frequent accel/decel overheats the motor. Reduce load or add cool-down pauses." },
+      { title:"Check motor-specific parameters (B-65280EN)",
+        detail:"Verify motor parameters are set correctly for this motor model. Incorrect OVC parameters cause premature alarm." },
+      { title:"If motor is cool — check sensor and feedback cable",
+        detail:"Temperature sensor or wiring may be faulty. Check feedback cable connector for coolant ingress." },
+    ],
+    source:"B-65285EN §3.4.1" },
+  { code:"02", title:"Motor Speed Deviation",
+    desc:"Actual motor speed largely deviates from commanded speed during acceleration or heavy load. Check acceleration parameter (4082) and motor-specific parameters.",
+    steps:[
+      { title:"Check if alarm occurs during acceleration",
+        detail:"If the alarm fires only during accel/decel, increase parameter 4082 (acceleration time constant)." },
+      { title:"Check motor-specific parameters (B-65280EN)",
+        detail:"Verify parameters match the motor model. Wrong motor type or gain settings cause speed deviation." },
+      { title:"Check for mechanical overload on spindle",
+        detail:"Excessive cutting load or bearing resistance prevents the motor from reaching commanded speed." },
+      { title:"Replace SPM if parameters and mechanics are OK",
+        detail:"If all parameters are correct and no mechanical issue, the SPM's speed control circuit may be faulty." },
+    ],
+    source:"B-65285EN §3.4.2" },
+  { code:"03", title:"DC Link Fuse Blown",
+    desc:"DC link fuse inside SPM blown. Replace SPM. Likely causes: power lead or motor winding short to ground, IGBT/IPM failure.",
+    steps:[
+      { title:"Check motor power leads for short-circuit",
+        detail:"Before replacing SPM, check motor power leads (U/V/W) for short between phases or to ground. A shorted lead will blow the fuse again.",
+        warn:"Confirm DC link is discharged before touching any power terminals." },
+      { title:"Megger test the motor",
+        detail:"Disconnect motor from power leads. Megger each winding to frame at 500V. Below 1MΩ = motor insulation failed." },
+      { title:"Replace the SPM",
+        detail:"After confirming motor and cable are clean, replace the SPM. Internal fuse is not field-replaceable." },
+    ],
+    source:"B-65285EN §3.4.3" },
+  { code:"04", title:"Converter Input Open Phase",
+    desc:"Open phase on the converter (αiPS) 3-phase main input. The SPM reports 04, but the fault is converter-side — the αiPS faceplate shows E. Check the 3-phase input voltage; if the supply is good, check the input terminal connections at the converter.",
+    source:"B-65285EN §3.1.11" },
+  { code:"06", title:"Temperature Sensor Abnormal",
+    desc:"Temperature sensor or sensor cable defective. Check motor-specific parameters, feedback cable, control PCB, or thermo sensor.",
+    steps:[
+      { title:"Check feedback cable connector for coolant ingress",
+        detail:"The temperature sensor signal travels through the feedback cable. Coolant in the connector causes false readings. Clean and dry." },
+      { title:"Check motor-specific parameters (B-65280EN)",
+        detail:"Verify the temperature sensor type parameter matches the actual motor." },
+      { title:"Check sensor wiring continuity",
+        detail:"If cable and parameters are OK, the thermistor or its wiring has failed. Replace feedback cable first; if alarm persists, motor sensor is faulty." },
+    ],
+    source:"B-65285EN §3.4.4" },
+  { code:"07", title:"Overspeed",
+    desc:"Motor speed exceeded 115% of maximum allowable speed. Check spindle synchronization sequence or replace SPM.",
+    steps:[
+      { title:"Check if alarm occurs during sync or thread cutting",
+        detail:"During synchronized operations, a timing glitch can cause brief overspeed. Check synchronization sequence and parameters." },
+      { title:"Check maximum speed parameter (P4020)",
+        detail:"Verify parameter 4020 is set to the correct maximum speed for this motor. Too low = false overspeed alarms." },
+      { title:"Replace SPM if speed detection is faulty",
+        detail:"If parameters are correct and no sync issue exists, the SPM speed detection circuit may be faulty." },
+    ],
+    source:"B-65285EN §3.4.5" },
+  { code:"09", title:"Main Circuit Overload / IPM Overheat",
+    desc:"Heatsink temperature rose abnormally. Check cooling fan operation, clean heatsink, review cutting conditions or ambient temperature.",
+    steps:[
+      { title:"Check SPM heatsink cooling fan",
+        detail:"Verify the fan is running. If stopped, check for debris, then the fan connector. Replace fan if motor failed." },
+      { title:"Clean the heatsink fins",
+        detail:"Use vacuum or compressed air to remove dust. Accumulated dust is the most common cause." },
+      { title:"Check cutting conditions and ambient temperature",
+        detail:"Heavy continuous spindle load or high cabinet temperature causes overheat." },
+      { title:"Push faceplate fully home",
+        detail:"A partially seated control PCB can cause false temperature readings." },
+      { title:"Replace SPM if all checks pass",
+        detail:"If fan, heatsink, load, and ambient are OK, the temperature sensor or SPM power stage has failed." },
+    ],
+    source:"B-65285EN §3.4.6" },
+  { code:"10", title:"Low Power Supply Input Voltage",
+    desc:"Control power supply voltage dropped. Work the 24 V control chain (CXA2A/B) end to end: input power, Power Supply unit, control cable, and the SPM — any one can pull the rail down. Swap in a known-good unit to isolate.",
+    source:"B-65285EN §3.4.7" },
+  { code:"11", title:"Converter DC Link Overvoltage",
+    desc:"DC link voltage on the converter (αiPS) is abnormally high. The SPM reports 11; the αiPS faceplate shows 7. Usually excessive regenerated power (PSM undersized for the duty) or high AC-source impedance. Check the PSM capacity and the source output impedance.",
+    source:"B-65285EN §3.1.8" },
+  { code:"12", title:"DC Link Overcurrent / IPM Alarm",
+    desc:"Excessively large current flowed into the main-circuit DC link. On αiSP2.2–15 (and 5.5HV–15HV) the IPM power module detected overcurrent/overload. Most often a motor power-lead short, motor insulation failure, wrong motor parameters, or a destroyed power element.",
+    steps:[
+      { title:"Reseat the control PCB (faceplate) fully",
+        detail:"A partially seated faceplate — or a detached connector between the control and power PCBs — can raise this alarm. Push the faceplate fully home first." },
+      { title:"If it fired right after a rotation command — check motor power leads",
+        detail:"Check the U/V/W power leads for a short between phases and a short to ground. Replace the lead if faulty.",
+        warn:"Confirm the DC link is discharged before touching power terminals." },
+      { title:"Megger the motor windings",
+        detail:"Disconnect the motor and megger each winding to frame. A ground fault in the winding means the motor is shorted — replace the motor." },
+      { title:"Check motor-specific parameters (B-65280EN)",
+        detail:"Wrong motor-specific parameters can drive excessive current. Verify they match the installed motor." },
+      { title:"If it fired during rotation — check heatsink and cooling",
+        detail:"A dirty heatsink or unmet installation/cooling condition can destroy a power element. Clean the heatsink; keep coolant off it." },
+      { title:"Replace the SPM",
+        detail:"If leads, motor, parameters and cooling are good, a power element (IGBT/IPM) is destroyed. Replace the Spindle Amplifier." },
+    ],
+    source:"B-65285EN §3.4.8" },
+  { code:"13", title:"CPU Internal Data Memory Error",
+    desc:"An error was detected in the CPU internal RAM. Not field-repairable — the Spindle Amplifier is abnormal, replace it.",
+    source:"B-65285EN §3.4.9" },
+  { code:"14", title:"Amplifier ID Not Registered",
+    desc:"Amplifier ID data is inconsistent with the software series/edition. Reseat the SPM control PCB fully; if the alarm persists, the SPM is faulty — replace it.",
+    source:"B-65285EN §3.4.10" },
+  { code:"15", title:"Output / Spindle Switching Alarm",
+    desc:"During output-switching or spindle-switching control the switch sequence didn't complete: 1 s or more elapsed from the switch request (SPSL/RSL) before the power-lead state-check signal (MCFN/MFNHG/RCH/RCHHG) responded. Usually the switching magnetic contactor, its check wiring/I-O, or the ladder timing.",
+    steps:[
+      { title:"Check the power-lead switching magnetic contactor",
+        detail:"If the contactor won't pull in, check its control supply. If it still won't operate, replace the contactor." },
+      { title:"Check the contact-check I/O unit and wiring",
+        detail:"The state-check signal comes back through I/O and wiring. If either is defective, repair or replace it." },
+      { title:"Check the ladder switching sequence timing",
+        detail:"The sequence must complete the switch within 1 second. Modify the ladder so switching finishes inside the time window." },
+    ],
+    source:"B-65285EN §3.4.11" },
+  { code:"16", title:"RAM Error (Dual Check Safety)",
+    desc:"The CPU internal RAM test failed under the Dual Check Safety function. Not field-repairable — replace the Spindle Amplifier.",
+    source:"B-65285EN §3.4.12" },
+  { code:"17", title:"Amplifier ID Data Error",
+    desc:"An error was detected in the amplifier ID data. Usually the control PCB is loose: power off, reseat the SPM control PCB (faceplate) fully, and retest. If it is correctly mounted and the alarm persists, the SPM is faulty — replace it.",
+    source:"B-65285EN §3.4.13" },
+  { code:"18", title:"Sum Check Abnormal",
+    desc:"Internal sum check failed. Replace SPM or SPM control PCB.",
+    steps:[
+      { title:"Power cycle the CNC and SPM",
+        detail:"Turn off all power, wait 30 seconds, power on. A transient memory error may clear." },
+      { title:"Replace SPM control PCB or entire SPM",
+        detail:"If alarm persists, the SPM internal memory has failed. Replace control PCB or SPM." },
+    ],
+    source:"B-65285EN §3.4.13" },
+  { code:"19", title:"Phase U Current Offset Error",
+    desc:"Phase U current detection circuit offset voltage too high at power-on. Replace SPM.",
+    steps:[
+      { title:"Power cycle and retest",
+        detail:"Turn off all power, wait 30 seconds, power on. Transient glitch may clear." },
+      { title:"Replace SPM",
+        detail:"If alarm persists, the Phase U current detection circuit has failed. Not field-repairable." },
+    ],
+    source:"B-65285EN §3.4.14" },
+  { code:"20", title:"Phase V Current Offset Error",
+    desc:"Phase V current detection circuit offset voltage too high at power-on. Replace SPM.",
+    steps:[
+      { title:"Power cycle and retest",
+        detail:"Turn off all power, wait 30 seconds, power on. Transient glitch may clear." },
+      { title:"Replace SPM",
+        detail:"If alarm persists, the Phase V current detection circuit has failed. Not field-repairable." },
+    ],
+    source:"B-65285EN §3.4.14" },
+  { code:"21", title:"Position Sensor Polarity Incorrect",
+    desc:"Position-sensor polarity parameters wrong. Pure parameter alarm — check P4000#0 and P4001#4 (not a cable fault; a miswired coder cable drops the signal = 27, it doesn't flip polarity).",
+    steps:[
+      { title:"Check motor rotation direction — P4000#0",
+        detail:"SYSTEM → PARAM → 4000 → bit 0. The manual lists this parameter first. It sets the spindle/motor rotation direction; a wrong value here raises '21'. Set it to match the machine's actual spindle direction. (FS15i: 3000#0.)" },
+      { title:"Check position-sensor polarity — P4001#4",
+        detail:"SYSTEM → PARAM → 4001 → bit 4. Sets the position-sensor feedback polarity / mounting direction. After a motor or coder change the new sensor may need the opposite setting. Correct it to match the installed sensor. (FS15i: 3001#4.)" },
+      { title:"Confirm what changed just before it appeared",
+        detail:"'21' almost always follows a motor/sensor swap, a parameter restore from the wrong file, or first commissioning — that points straight at which bit is wrong. Compare 4000#0 / 4001#4 against a known-good backup if you have one." },
+      { title:"Correct the parameters and power-cycle",
+        detail:"After setting P4000#0 and P4001#4 correctly, turn the CNC off and on so the spindle software re-reads them, then retest." },
+    ],
+    source:"B-65285EN §3.4.16, B-64115EN App.A" },
+  { code:"22", title:"Spindle Amplifier Current Overload",
+    desc:"Current exceeded the SPM time rating — typically a high frequency of accel/decel or heavy cutting load rather than a hardware fault. Ease the operating conditions (lower duty cycle, reduce load).",
+    source:"B-65285EN §3.4.17" },
+  { code:"24", title:"Serial Communication Error (CNC ↔ SPM)",
+    desc:"Communication data error between CNC and SPM. Check cable routing (separate from power leads), cable condition, or replace SPM/CNC board." },
+  { code:"27", title:"Position Coder Signal Disconnected",
+    desc:"α position coder signal lost. Check feedback cable connection and shielding. Replace cable or coder if persistent.",
+    steps:[
+      { title:"Check feedback cable connection at SPM and motor",
+        detail:"Verify both ends of the feedback cable are firmly seated. Look for bent pins, corrosion, or coolant contamination at connectors." },
+      { title:"Check cable shielding and routing",
+        detail:"The feedback cable must be routed separately from power cables. Check that the shield is grounded at one end only (typically the SPM end). Add ferrite cores if noise is suspected." },
+      { title:"Replace feedback cable, then position coder",
+        detail:"If the cable and connections are good but the alarm persists, replace the feedback cable first. If still alarming, the position coder has failed — replace it." },
+    ],
+    source:"B-65285EN §3.4.19" },
+  { code:"29", title:"Short-Period Overload",
+    desc:"Excessive load applied continuously for a period — OR the motor shaft locked while excited (the manual is explicit about this). Review the load, and check for a clamp/brake/jam holding the spindle.",
+    steps:[
+      { title:"Was the spindle held or clamped while excited?",
+        detail:"The manual's own note: '29' also fires when the motor shaft is locked in the excitation state. Check for an orientation/index clamp still engaged, a brake not fully releasing, a mechanical stop, or a jam while the drive was commanded — easy to miss and fastest to rule out." },
+      { title:"Review the cutting / load conditions",
+        detail:"Watch the spindle load meter during the operation that trips it. If it sits high, reduce depth of cut, feed, or speed, or add cool-down pauses so the sustained load stays within the motor/amp rating." },
+      { title:"Check for mechanical drag on the spindle",
+        detail:"Power off, turn the spindle by hand. Bearing wear, an over-tight belt, or a brake not fully releasing adds parasitic load that keeps current high even at moderate cutting." },
+      { title:"Verify motor parameters match the installed motor",
+        detail:"A wrong motor model selected (after a motor or SPM swap) makes the SPM's overload model miscalculate. Verify the spindle motor parameters against B-65280EN." },
+      { title:"Check the speed feedback if the load looks normal",
+        detail:"If the load is genuinely light but '29' still trips, degraded speed/position feedback can make the drive push extra current. Check the feedback cable and sensor before condemning the amp." },
+    ],
+    source:"B-65285EN §3.4.20, B-64115EN App.A" },
+  { code:"30", title:"Converter Input Overcurrent",
+    desc:"Overcurrent into the converter (αiPS) main input circuit. The SPM reports 30; the αiPS faceplate shows 1. Check input voltage balance and that the AC reactor spec matches the converter; on larger units a shorted IGBT/IPM can cause it.",
+    source:"B-65285EN §3.1.2" },
+  { code:"31", title:"Motor Failed to Rotate as Commanded",
+    desc:"Motor not reaching commanded speed or not rotating. Check phase sequence, power lead, feedback cable, or spindle lock sequence.",
+    steps:[
+      { title:"Check motor power lead connection — phase sequence",
+        detail:"Verify U/V/W power leads are connected correctly at the SPM and at the motor terminal box. Swapped phases cause the motor to fight itself." },
+      { title:"Check feedback cable",
+        detail:"A disconnected or faulty feedback cable prevents the SPM from detecting rotation. Check connections at both ends." },
+      { title:"Check for spindle lock / mechanical obstruction",
+        detail:"Verify the spindle rotates freely by hand (power off). Check for brake engagement, chuck jam, or gear lock." },
+      { title:"Check spindle switching sequence (if multi-winding motor)",
+        detail:"Motors with winding changeover (high/low speed) require the correct switching sequence. Check magnetic contactors and control signals." },
+    ],
+    source:"B-65285EN §3.4.21" },
+  { code:"32", title:"LSI Memory Abnormal",
+    desc:"Serial communication LSI memory abnormal at power-on. Replace SPM or control PCB.",
+    steps:[
+      { title:"Power cycle and retest",
+        detail:"Turn off all power, wait 30 seconds, power on. A transient memory error may clear on retry." },
+      { title:"Replace SPM control PCB or SPM",
+        detail:"If the alarm persists, the serial communication LSI memory has failed permanently. Replace the control PCB (faceplate) or the entire SPM." },
+    ],
+    source:"B-65285EN §3.4.22" },
+  { code:"33", title:"Converter DC Link Precharge Failure",
+    desc:"The converter (αiPS) DC link didn't recharge within the allowed time. The SPM reports 33; the αiPS faceplate shows 5. Check for too many amplifiers on the PSM, a short across the DC link, or a failed precharge (current-limiting) resistor / distributing board.",
+    source:"B-65285EN §3.1.6" },
+  { code:"34", title:"Parameter Out of Range",
+    desc:"Parameter data outside specifiable range. Connect spindle check board — it displays the faulty parameter number (F-xxx).",
+    steps:[
+      { title:"Use spindle check board to identify the bad parameter",
+        detail:"Connect the FANUC spindle check board. It displays the faulty parameter number as F-xxx. This tells you exactly which parameter is out of range." },
+      { title:"Restore parameters from backup",
+        detail:"If a backup exists, restore spindle parameters and power cycle. If no backup, correct the identified parameter per B-65280EN." },
+    ],
+    source:"B-65285EN §3.4.23" },
+  { code:"36", title:"Error Counter Overflow",
+    desc:"The position error counter overflowed. Manual order: first check for an excessively large gear ratio, then (if the ratio is right) INCREASE the position gain, then check for a sequence error.",
+    steps:[
+      { title:"Confirm what changed just before it appeared",
+        detail:"'36' is a parameter/sequence fault — it usually follows a parameter edit/restore or a change in a position-control operation (rigid tap, Cs, spindle sync). Establish what was touched or what mode was commanded." },
+      { title:"Check the gear ratio parameters (4056–4059)",
+        detail:"The manual's first named cause: an excessively large gear ratio. Verify each stage's spindle-to-motor ratio against the actual gearing and allowable range per B-65280EN. (FS15i: 3056–3059.)" },
+      { title:"If the ratio is correct, raise the position gain",
+        detail:"With a correct gear ratio the manual's remedy is to INCREASE the position gain — 4060–4063 (orientation), 4065–4068 (servo/spindle sync), or 4069–4072 (Cs), for the mode in use. Too low a gain lets the counter run away." },
+      { title:"Check for a sequence error (SFR/SRV dropped in a position mode)",
+        detail:"Confirm the motor wasn't de-excited by SFR/SRV dropping while in rigid tapping, Cs contour, or spindle synchronization. Fix the ladder/sequence so excitation is held through the move." },
+    ],
+    source:"B-65285EN §3.4.24" },
+
+  { code:"37", title:"Motor Accelerated After E-Stop",
+    desc:"Motor accelerated instead of decelerating after E-stop signal. Check speed detector parameter settings.",
+    steps:[
+      { title:"Check speed detector parameters",
+        detail:"The speed feedback direction must match the motor's actual rotation direction. If inverted, the SPM accelerates instead of braking during E-stop. Check the speed detector direction parameter." },
+      { title:"Check feedback cable connection",
+        detail:"A faulty or swapped feedback cable can invert the speed signal, causing acceleration on E-stop. Verify the connection." },
+      { title:"Replace SPM if parameters are correct",
+        detail:"If parameters and feedback are correct, the SPM's internal speed control logic may be faulty." },
+    ],
+    source:"B-65285EN §3.4.25" },
+  { code:"41", title:"Position Coder One-Rotation Signal Position Error",
+    desc:"One-rotation signal generated at incorrect position. Check position coder mounting and parameter settings.",
+    steps:[
+      { title:"Check position coder mounting",
+        detail:"The position coder must be aligned correctly on the motor shaft. If it has shifted or the coupling is loose, the one-rotation signal appears at the wrong position." },
+      { title:"Check position coder parameters",
+        detail:"Verify the parameter settings for the position coder match the installed coder type and motor configuration." },
+      { title:"Replace position coder if mounting is correct",
+        detail:"If the coder is properly mounted and parameters are correct, the coder's one-rotation signal generator has failed." },
+    ],
+    source:"B-65285EN §3.4.27" },
+  { code:"42", title:"One-Rotation Signal Not Generated",
+    desc:"α position coder one-rotation signal not detected. Check parameter settings and feedback cable.",
+    steps:[
+      { title:"Check feedback cable connection",
+        detail:"The one-rotation signal travels through the feedback cable. Check both connectors for loose pins or damage." },
+      { title:"Check parameter settings",
+        detail:"Verify the position coder type parameter matches the installed coder. Wrong type setting = wrong signal expectations." },
+      { title:"Replace feedback cable, then position coder",
+        detail:"If connections and parameters are OK, the signal is not being generated. Replace the cable first, then the coder." },
+    ],
+    source:"B-65285EN §3.4.27" },
+  { code:"43", title:"Master Position Coder Disconnected (Differential Mode)",
+    desc:"The position coder signal of the MASTER spindle used in differential spindle speed control is disconnected. The manual troubleshoots this exactly like alarm code 27 — but the suspect device is the master spindle's coder and its cable, not the slave's.",
+    steps:[
+      { title:"Confirm which spindle is the master",
+        detail:"Differential speed control uses one spindle's position coder as the reference. This alarm is about the MASTER coder signal — identify the master before swapping the wrong device." },
+      { title:"Check the master coder feedback cable at both ends",
+        detail:"Verify both ends of the master spindle's feedback cable are firmly seated. Look for bent pins, corrosion, or coolant ingress at the connectors." },
+      { title:"Check cable shielding and routing",
+        detail:"Route the feedback cable separately from power leads; ground the shield at the SPM end only. If the alarm follows cable movement, the conductor is likely broken inside — replace the cable." },
+      { title:"Replace the master coder cable, then the coder",
+        detail:"If connections and routing are good, replace the master spindle's feedback cable first; if it still alarms, the position coder has failed — replace it." },
+    ],
+    source:"B-65285EN §3.4.28 (see also code 27)" },
+  { code:"46", title:"One-Rotation Signal Error During Thread Cutting",
+    desc:"One-rotation signal cannot be detected normally during thread cutting. Troubleshoot as alarm 41.",
+    steps:[
+      { title:"Troubleshoot as SPM alarm 41",
+        detail:"This alarm has the same cause as alarm 41 — the one-rotation signal position is wrong. Follow the same procedure: check coder mounting, parameters, and feedback cable." },
+      { title:"Check spindle speed during thread cutting",
+        detail:"If the spindle speed is too high during thread cutting, the one-rotation signal timing may be missed. Reduce the threading speed and retest." },
+    ],
+    source:"B-65285EN §3.4.29" },
+  { code:"47", title:"Position Coder Pulse Count Abnormal",
+    desc:"Phase A/B pulse count abnormal between one-rotation signals. Check position coder and cable.",
+    steps:[
+      { title:"Check feedback cable for damage",
+        detail:"Damaged cable can drop pulses. Check the entire cable run for crushed, kinked, or cut sections. Check connectors for bent pins." },
+      { title:"Check for electrical noise",
+        detail:"If the alarm is intermittent, noise may be causing pulse errors. Check cable routing — separate from power cables. Add ferrite cores." },
+      { title:"Replace position coder",
+        detail:"If the cable is good and noise is not the cause, the position coder's pulse generator has failed." },
+    ],
+    source:"B-65285EN §3.4.30" },
+  { code:"49", title:"Differential Speed Conversion Overflow",
+    desc:"In differential spindle speed control, the master spindle speed converted to the slave motor speed exceeded the allowable range. This is an operating/parameter condition, not a hardware fault — the converted speed is over the slave motor's maximum.",
+    steps:[
+      { title:"Understand the conversion",
+        detail:"The master spindle speed is multiplied by the slave spindle-to-motor gear ratio to get the required slave motor speed. When that result exceeds the slave motor's maximum speed, the alarm fires." },
+      { title:"Reduce the commanded master spindle speed",
+        detail:"Operate the machine so the converted speed stays within the slave motor's maximum. Lowering the master speed is the immediate fix." },
+      { title:"Check the gear ratio parameters (4056–4059)",
+        detail:"Verify the spindle-to-motor gear ratio parameters are correct. An oversized ratio drives the converted speed over the limit even at normal master speeds." },
+      { title:"Check the slave motor maximum speed setting",
+        detail:"Confirm the slave motor's maximum-speed parameter matches the installed motor. A too-low value trips this alarm even at legitimate speeds." },
+    ],
+    source:"B-65285EN §3.4.31" },
+  { code:"50", title:"Spindle Sync Calculation Overflow",
+    desc:"An internal calculation in spindle synchronization exceeded the allowable range. First check the gear ratio; if it's correct, raise the spindle-sync position gain.",
+    steps:[
+      { title:"Check if parameters were recently changed",
+        detail:"This alarm almost always follows a parameter edit or restore. Compare 4056–4059 and 4065–4068 against a known-good backup first." },
+      { title:"Check the gear ratio parameters (4056–4059)",
+        detail:"The manual's first named cause: an excessively large gear ratio inflates the sync calculation. Verify the spindle-to-motor ratio against the actual gearing per B-65280EN." },
+      { title:"If the ratio is correct, raise the position gain (4065–4068)",
+        detail:"§3.4.32(b): with a correct gear ratio, INCREASE the position gain used in spindle synchronization (4065–4068). Do not skip this — it's the remedy the manual prescribes for code 50." },
+    ],
+    source:"B-65285EN §3.4.32" },
+
+  { code:"51", title:"Converter DC Link Undervoltage",
+    desc:"The converter (αiPS) DC link voltage dropped. The SPM reports 51; the αiPS faceplate shows 4. Usually a momentary power dip or low input voltage; it can also fire if the main-circuit power is cut with E-stop released. Check the supply and the E-stop sequence.",
+    source:"B-65285EN §3.1.5" },
+  { code:"52", title:"ITP Synchronization Signal Stopped",
+    desc:"Synchronization signal in CNC-SPM communication stopped. Replace SPM.",
+    steps:[
+      { title:"Power cycle and retest",
+        detail:"Turn off all power, wait 30 seconds, power on. A one-time communication glitch may clear." },
+      { title:"Check spindle optical cable",
+        detail:"The ITP signal travels through the optical link. Check the cable connectors and replace if damaged." },
+      { title:"Replace SPM",
+        detail:"If the alarm persists, the SPM's communication circuit has lost synchronization. Replace the SPM." },
+    ],
+    source:"B-65285EN §3.4.33" },
+  { code:"53", title:"ITP Synchronization Signal Stopped",
+    desc:"Same as alarm 52. Replace SPM.",
+    steps:[
+      { title:"Power cycle and retest",
+        detail:"Same troubleshooting as alarm 52. Turn off all power, wait 30 seconds, power on." },
+      { title:"Replace SPM",
+        detail:"If the alarm persists after power cycle and cable check, replace the SPM." },
+    ],
+    source:"B-65285EN §3.4.33" },
+  { code:"54", title:"Excessive Continuous Load (extended)",
+    desc:"Same diagnostic as alarm 29.",
+    steps:[
+      { title:"Same troubleshooting as SPM alarm 29",
+        detail:"This is the extended version of the continuous load alarm. Follow the same procedure: review cutting conditions, check for mechanical resistance, verify feedback cable and parameters." },
+    ],
+    source:"B-65285EN §3.4.34" },
+  { code:"55", title:"Switching Control Signal Mismatch",
+    desc:"Mismatch between switching request signal and power lead state check signal during motor activation. Check magnetic contactors.",
+    steps:[
+      { title:"Check magnetic contactor operation",
+        detail:"The SPM commands the magnetic contactor to switch motor windings. If the contactor's feedback signal doesn't match the command, this alarm fires. Check the contactor coil, contacts, and auxiliary contacts." },
+      { title:"Check contactor feedback wiring",
+        detail:"Verify the auxiliary contact wiring from the contactor to the SPM is correct and not damaged." },
+      { title:"Replace contactor if contacts are worn",
+        detail:"Worn or welded contactor contacts cause feedback mismatch. Replace the contactor." },
+    ],
+    source:"B-65285EN §3.4.35" },
+  { code:"56", title:"Control Circuit Fan Stopped",
+    desc:"Cooling fan for SPM control circuit section stopped. Push faceplate fully home and check fan connector.",
+    steps:[
+      { title:"Push faceplate (control PCB) fully home",
+        detail:"The fan connector mates when the faceplate is pushed in. If not fully seated, the fan may not receive power or the fan detection signal may be lost." },
+      { title:"Check fan connector on control PCB",
+        detail:"Remove the faceplate and verify the fan cable connector is firmly seated on the PCB header. Reseat it." },
+      { title:"Check for obstructions in the fan",
+        detail:"Look for debris or foreign material blocking the fan blades." },
+      { title:"Replace the fan, then SPM if needed",
+        detail:"If the fan doesn't spin with clear blades and good connection, replace the fan. If a new fan still triggers the alarm, the SPM's fan drive circuit has failed." },
+    ],
+    source:"B-65285EN §3.4.36" },
+  { code:"57", title:"Converter Excess Deceleration Power",
+    desc:"Converter regenerative-resistor overheat. The SPM shows 57; the αiPS/αiPSR faceplate shows 'H'. One converter fault on two displays — the fix is converter-side. αiPSR only.",
+    source:"B-65285EN §3.1.12" },
+  { code:"58", title:"Converter Main Circuit Overload",
+    desc:"Converter main-circuit overload. SPM shows 58; the αiPS faceplate shows '3'. One converter fault on two displays — the fix is converter-side.",
+    source:"B-65285EN §3.1.3" },
+  { code:"59", title:"Converter Cooling Fan Stopped",
+    desc:"Converter cooling-fan failure. SPM shows 59; the αiPS faceplate shows '2'. One converter fault on two displays — the fix is converter-side.",
+    source:"B-65285EN §3.1.2" },
+  { code:"b1", title:"Converter Control Power Low Voltage",
+    desc:"Converter control-power undervoltage. SPM shows b1; the αiPS faceplate shows '6'. One converter fault on two displays — the fix is converter-side.",
+    source:"B-65285EN §3.1.6" },
+  { code:"b2", title:"Converter Excessive Regenerative Power",
+    desc:"Converter excessive regenerative power. SPM shows b2; the αiPS faceplate shows '8'. One converter fault on two displays — the fix is converter-side.",
+    source:"B-65285EN §3.1.8" },
+  { code:"b3", title:"Converter Radiator Fan Stopped",
+    desc:"Converter radiator-fan failure. SPM shows b3; the αiPS faceplate shows 'A'. One converter fault on two displays — the fix is converter-side.",
+    source:"B-65285EN §3.1.9" },
+  { code:"66", title:"Spindle-Amplifier Communication Error",
+    desc:"Communication error via connector JX4 between spindle and amplifier. Check JX4 connection.",
+    steps:[
+      { title:"Check JX4 connector on SPM",
+        detail:"The JX4 connector handles inter-amplifier communication. Verify it is firmly seated. Check for bent pins or corrosion." },
+      { title:"Check JX4 cable",
+        detail:"Inspect the cable from JX4 for damage, cuts, or loose terminations." },
+      { title:"Replace SPM if connector and cable are OK",
+        detail:"If the connection is good but the alarm persists, the SPM's communication circuit has failed." },
+    ],
+    source:"B-65285EN §3.4.39" },
+  { code:"73", title:"Motor Sensor Signal Disconnected",
+    desc:"MZi or BZi motor sensor signal lost. Check feedback cable, connector, and shielding.",
+    steps:[
+      { title:"Check feedback cable connector at motor and SPM",
+        detail:"The MZi/BZi sensor signal travels through the feedback cable. Check both connectors for loose pins, corrosion, or coolant ingress." },
+      { title:"Check cable for damage and shielding",
+        detail:"Inspect the entire cable run. Check that the shield is grounded properly. Route separately from power cables." },
+      { title:"Replace feedback cable, then motor sensor",
+        detail:"If connectors are good, replace the cable. If alarm persists with new cable, the motor sensor has failed." },
+    ],
+    source:"B-65285EN §3.4.45" },
+  { code:"61", title:"Excessive Dual-Feedback Position Error",
+    desc:"Semi-closed vs closed-loop position difference exceeded param 4354 (dual position feedback). New setup → check conversion coefficients 4171–4174; ran fine before → motor-to-spindle slip or feedback noise.",
+    steps:[
+      { title:"New setup — check conversion coefficients",
+        detail:"Verify the motor-end conversion coefficients: 4171/4172 (high gear), 4173/4174 (low gear), plus sensor params per B-65280EN. A wrong coefficient diverges the two feedbacks immediately." },
+      { title:"Coefficients OK — raise the level (4354)",
+        detail:"If the coefficients are right and it still trips, the detection level in parameter 4354 may be too low. Widen it within reason." },
+      { title:"Ran fine before — check for mechanical slip",
+        detail:"On a previously-good machine, suspect belt/coupling/key slip between motor and spindle. Inspect the drive train." },
+      { title:"Intermittent — chase feedback noise",
+        detail:"Occasional trips point to a count error from noise on the motor-end or spindle-end feedback. Check shielding, grounding, and cable routing." },
+    ],
+    source:"B-65285EN §3.4.37" },
+  { code:"67", title:"Ref Return Commanded in Spindle EGB Mode",
+    desc:"A reference-position-return command was issued to the slave axis while spindle EGB (G81) was active. Not a hardware fault — cancel EGB with G80 before referencing.",
+    steps:[
+      { title:"Cancel EGB (G80) before ref return",
+        detail:"Reference return cannot run while spindle EGB (G81) sync is engaged. Turn EGB off with G80, then reference the axis." },
+      { title:"Fix the program/PMC sequence",
+        detail:"Reorder the program so any reference return happens outside the G81…G80 block, and confirm no macro or PMC path commands a ref return during EGB." },
+    ],
+    source:"B-65285EN §3.4.40" },
+  { code:"b0", title:"Inter-Amplifier Communication Error",
+    desc:"Serial communication failed across the amplifier chain (SP ↔ SV ↔ PS) on CXA2A/CXA2B. Most common right after power-on: mis-coupled connector or bad interface cable. CNC shows SP9110.",
+    steps:[
+      { title:"Check CXA2A / CXA2B coupling",
+        detail:"If 'b0' appears right after power-on, confirm every hop is CXA2A (upstream) → CXA2B (next unit) along PS→SV→SP. A reversed or wrong-port connector breaks the chain." },
+      { title:"Check the interface cable and pin numbers",
+        detail:"Verify the CXA2A/B cable pin numbers and integrity; correct the wiring or replace the cable." },
+      { title:"Isolate the faulty amplifier",
+        detail:"If coupling and cable are good, disconnect units from the chain one at a time to find the defective Spindle, Servo, or Power Supply. Replace that unit or its control PCB." },
+    ],
+    source:"B-65285EN §3.4.66" },
+  { code:"65", title:"Magnetic Pole Detection Error (BiS)",
+    desc:"Abnormal travel in magnetic-pole determination — BiS (synchronous) motors only. Params (teeth/phases), power-lead phase sequence, locked motor, sensor/rotor slip, or noise. CNC shows SP9065.",
+    steps:[
+      { title:"Check teeth/phase parameters", detail:"Bits 2,1,0 of 4011 + 4334 (teeth); bits 7,3 of 4011 + 4368 (phases)." },
+      { title:"Check power-lead phase sequence vs sensor feedback", detail:"A swapped phase makes pole detection impossible. Confirm the power lead is connected." },
+      { title:"Confirm the motor can move smoothly", detail:"Locked motor or high friction fails detection. Free the spindle first." },
+      { title:"Check sensor/rotor slip and noise", detail:"Slip changes the sensor-rotor phase relationship; noise corrupts counts." },
+    ],
+    source:"B-65285EN §3.4.38" },
+  { code:"69", title:"DCS: Safety Speed Exceeded",
+    desc:"Dual Check Safety only — spindle exceeded the safety speed with the guard open (mode C). CNC shows SP9069.",
+    steps:[
+      { title:"Observe the safety speed with guard open", detail:"Check whether program/operator commanded over-limit speed with the guard open." },
+      { title:"Check the safety-speed parameter", detail:"Verify against the machine builder's specification — never raise it beyond spec." },
+      { title:"Replace SPM control PCB", detail:"If operation and parameter are correct." },
+    ],
+    source:"B-65285EN §3.4.41" },
+  { code:"70", title:"DCS: Connection/Setting Mismatch",
+    desc:"Dual Check Safety only — SP connection status doesn't match the hardware setting. CNC shows SP9070.",
+    steps:[
+      { title:"Check SP connection and setting", detail:"Especially after rewiring, amp swap, or config change." },
+      { title:"Replace CNC CPU card or SPM control PCB", detail:"If connection and setting agree." },
+    ],
+    source:"B-65285EN §3.4.42" },
+  { code:"71", title:"DCS: Safety Parameter Error",
+    desc:"Dual Check Safety only — a safety parameter error occurred. CNC shows SP9071.",
+    steps:[
+      { title:"Re-set the safety parameters", detail:"Reload from the machine's documented values per the DCS setup procedure." },
+      { title:"Replace CNC CPU card or SPM control PCB", detail:"If a clean re-set still alarms." },
+    ],
+    source:"B-65285EN §3.4.43" },
+  { code:"72", title:"DCS: Speed Check Mismatch",
+    desc:"Dual Check Safety only — SP speed check disagrees with CNC speed check. CNC shows SP9072.",
+    steps:[
+      { title:"Replace CNC CPU card or SPM control PCB", detail:"The manual's direct action — one of the two checking channels is faulty." },
+    ],
+    source:"B-65285EN §3.4.44" },
+  { code:"74", title:"DCS: CPU Test Alarm",
+    desc:"Dual Check Safety only — the SP CPU self-test failed to end normally. CNC shows SP9074.",
+    steps:[
+      { title:"Replace the SPM or its control PCB", detail:"No parameter or wiring fix for a failed CPU self-test." },
+    ],
+    source:"B-65285EN §3.4.46" },
+  { code:"75", title:"DCS: CRC Test Alarm",
+    desc:"Dual Check Safety only — CRC (memory integrity) test error. CNC shows SP9075.",
+    steps:[
+      { title:"Replace the SPM or its control PCB", detail:"The manual's direct action for a CRC failure." },
+    ],
+    source:"B-65285EN §3.4.47" },
+  { code:"76", title:"DCS: Safety Function Not Executed",
+    desc:"Dual Check Safety only — the spindle safety function was not executed. CNC shows SP9076.",
+    steps:[
+      { title:"Replace the SPM control PCB", detail:"The manual's direct action." },
+    ],
+    source:"B-65285EN §3.4.48" },
+  { code:"77", title:"DCS: Axis Number Check Mismatch",
+    desc:"Dual Check Safety only — SP axis-number check disagrees with CNC. CNC shows SP9077.",
+    steps:[
+      { title:"Replace CNC CPU card or SPM control PCB", detail:"The manual's direct action." },
+    ],
+    source:"B-65285EN §3.4.49" },
+  { code:"78", title:"DCS: Safety Parameter Mismatch",
+    desc:"Dual Check Safety only — SP safety-parameter check disagrees with CNC. CNC shows SP9078.",
+    steps:[
+      { title:"Re-set safety parameters on both sides", detail:"Redo the DCS parameter setup so CNC and amp hold the same set." },
+      { title:"Replace CNC CPU card or SPM control PCB", detail:"If a clean re-set still mismatches." },
+    ],
+    source:"B-65285EN §3.4.50" },
+  { code:"79", title:"DCS: Abnormal Initial Test",
+    desc:"Dual Check Safety only — abnormal operation in the initial test. CNC shows SP9079.",
+    steps:[
+      { title:"Replace the SPM or its control PCB", detail:"The manual's direct action." },
+    ],
+    source:"B-65285EN §3.4.51" },
+  { code:"80", title:"Destination Amplifier Alarm (JX4)",
+    desc:"This amp is fine — the DESTINATION amplifier on the JX4 link has the alarm. CNC shows SP9080.",
+    steps:[
+      { title:"Read the destination amp's display", detail:"Follow the JX4 link to the other SP and read its 7-seg code." },
+      { title:"Work that alarm instead", detail:"When the destination amp's alarm clears, '80' clears with it." },
+    ],
+    source:"B-65285EN §3.4.52" },
+  { code:"81", title:"Motor Sensor 1-Rot Signal Position Error",
+    desc:"One-rotation signal generated at the wrong position. External signal → gear-ratio params 4171–4174 + slip; otherwise sensor params/adjustment/shielding. CNC shows SP9081.",
+    steps:[
+      { title:"External signal — check gear ratio 4171–4174", detail:"Denominator 4171/4173, numerator 4172/4174 of motor-sensor-to-spindle ratio." },
+      { title:"External signal — check for slip", detail:"No slippage allowed; external 1-rot signal can't be used on V-belt drives." },
+      { title:"Check sensor params and adjustment", detail:"Per B-65280EN; if the sensor won't adjust, replace cable and sensor." },
+      { title:"Check shielding/routing, then SPM", detail:"Separate from power leads; replace SPM/control PCB last." },
+    ],
+    source:"B-65285EN §3.4.53" },
+  { code:"82", title:"Motor Sensor 1-Rot Signal Not Detected",
+    desc:"No one-rotation signal from the motor sensor. Params → sensor adjustment → EXTSC1 check pin → SPM. CNC shows SP9082.",
+    steps:[
+      { title:"Check sensor parameters", detail:"Per B-65280EN — wrong sensor type means the signal never comes." },
+      { title:"Adjust the αiMZ/αiBZ sensor", detail:"If it won't adjust or no signal is observed, replace cable and sensor." },
+      { title:"External signal — probe EXTSC1", detail:"On the spindle check board: no pulse per rotation → replace cable and position coder." },
+      { title:"Replace the SPM", detail:"If sensor and signal check out." },
+    ],
+    source:"B-65285EN §3.4.54" },
+  { code:"83", title:"Motor Sensor Signal Error",
+    desc:"Phase A/B pulse count between 1-rot signals out of range. Cable-movement trips → broken conductor/coolant; else params/adjustment/shielding. CNC shows SP9083.",
+    steps:[
+      { title:"Fires when cable moves — replace the cable", detail:"Broken conductor inside the moving run; clean coolant from connectors." },
+      { title:"Check params and sensor adjustment", detail:"Per B-65280EN; replace cable and sensor if it won't adjust." },
+      { title:"Check shielding/routing, then SPM", detail:"Shield per B-65282EN; separate from power leads; replace SPM last." },
+    ],
+    source:"B-65285EN §3.4.55" },
+  { code:"84", title:"Spindle Sensor Disconnected",
+    desc:"Spindle-side sensor signal disconnected. Same troubleshooting as code 73, applied to the spindle sensor. CNC shows SP9084.",
+    steps:[
+      { title:"Check sensor parameters", detail:"Spindle-sensor settings per B-65280EN." },
+      { title:"Check/replace the cable", detail:"Movement-correlated trips = broken conductor; clean coolant from connectors." },
+      { title:"Adjust or replace the sensor", detail:"Replace cable and sensor together if it won't adjust." },
+      { title:"Check shielding, then SPM", detail:"Separate from power leads; replace SPM/control PCB last." },
+    ],
+    source:"B-65285EN §3.4.56 (→ 73)" },
+  { code:"85", title:"Spindle Sensor 1-Rot Position Error",
+    desc:"Spindle-sensor one-rotation signal in the wrong location. Same troubleshooting as code 81. CNC shows SP9085.",
+    steps:[
+      { title:"Check gear-ratio params and slip", detail:"4171–4174; external 1-rot signal not applicable to V-belt drives." },
+      { title:"Check sensor params/adjustment", detail:"Per B-65280EN; replace cable and sensor if it won't adjust." },
+      { title:"Check shielding, then SPM", detail:"Separate from power leads; replace SPM/control PCB last." },
+    ],
+    source:"B-65285EN §3.4.57 (→ 81)" },
+  { code:"86", title:"Spindle Sensor 1-Rot Not Detected",
+    desc:"No one-rotation signal from the spindle sensor. Same troubleshooting as code 82. CNC shows SP9086.",
+    steps:[
+      { title:"Check sensor parameters", detail:"Per B-65280EN." },
+      { title:"Adjust the sensor", detail:"Replace cable and sensor if it won't adjust or no signal is observed." },
+      { title:"Probe EXTSC1 / replace SPM", detail:"No pulse per rotation → replace cable and position coder; then SPM." },
+    ],
+    source:"B-65285EN §3.4.58 (→ 82)" },
+  { code:"87", title:"Spindle Sensor Signal Error",
+    desc:"Spindle-sensor pulse count out of range. Same troubleshooting as code 83. CNC shows SP9087.",
+    steps:[
+      { title:"Fires when cable moves — replace the cable", detail:"Broken conductor; clean coolant from connectors." },
+      { title:"Check params/adjustment/shielding", detail:"Per B-65280EN and B-65282EN; separate from power leads." },
+      { title:"Replace the SPM", detail:"If all checks pass." },
+    ],
+    source:"B-65285EN §3.4.59 (→ 83)" },
+  { code:"88", title:"SPM Radiator Fan Stopped",
+    desc:"The heat-sink (radiator) cooling fan of the SP is not running. Replace the fan. Distinct from '56' (control-circuit fan). CNC shows SP9088.",
+    steps:[
+      { title:"Confirm the heat-sink fan is stopped", detail:"Visual check at power-on; clear chips/dust and reseat the connector first." },
+      { title:"Replace the heat-sink cooling fan", detail:"Per the fan-replacement procedure (§4.1). New fan still alarms → replace the SPM." },
+    ],
+    source:"B-65285EN §3.4.60" },
+  { code:"89", title:"Sub-Module SM (SSM) Error (BiS)",
+    desc:"SSM abnormal — BiS (synchronous) motors only. Check JYA4↔CX31 cable; unsupported SPM at first start; else replace SSM. CNC shows SP9089.",
+    steps:[
+      { title:"Check the JYA4 ↔ CX31 cable", detail:"Interface signal cable between SPM JYA4 and SSM CX31 — connected and sound at both ends." },
+      { title:"First start — confirm SPM supports SSM", detail:"Unsupported amp → replace the SPM with a supporting model." },
+      { title:"Replace the SSM", detail:"If cable and support check out." },
+    ],
+    source:"B-65285EN §3.4.61" },
+  { code:"90", title:"Unexpected Rotation (BiS)",
+    desc:"Torque-command polarity vs acceleration mismatch — BiS motors only. Teeth/phase params, AMR offset 4084/4085, slip after a crash, or noise. CNC shows SP9090.",
+    steps:[
+      { title:"Check teeth/phase parameters", detail:"Per B-65280EN." },
+      { title:"Check AMR offset 4084 / 4085", detail:"Readjust 4084 after sensor replacement, shaft slip, or params from another machine; 4085 normally 0." },
+      { title:"After a crash — suspect sensor/rotor slip", detail:"Re-establish the phase relationship, then readjust AMR offset." },
+      { title:"Chase noise", detail:"Shielding, grounding, separation from power leads." },
+    ],
+    source:"B-65285EN §3.4.62" },
+  { code:"91", title:"Pole Position Count Miss (BiS)",
+    desc:"Pole position at 1-rot signal disagrees with AMR offset (4084) — BiS motors only. Params, sensor-ring slip, or noise. CNC shows SP9091.",
+    steps:[
+      { title:"Check teeth/phase parameters", detail:"Per B-65280EN — the start-up cause." },
+      { title:"Check for sensor-ring slip", detail:"A slipped ring generates spurious 1-rot signals. Fix the mount, readjust AMR offset." },
+      { title:"Apply noise countermeasures", detail:"If mechanically sound: shielding, grounding, separation." },
+    ],
+    source:"B-65285EN §3.4.63" },
+  { code:"92", title:"Velocity-Command Overspeed",
+    desc:"Motor speed exceeded the overspeed level for the commanded velocity. Params, AMR offset (BiS), or noise on a previously-good machine. CNC shows SP9092.",
+    steps:[
+      { title:"Check teeth/phase parameters", detail:"Wrong scaling misreads speed — per B-65280EN." },
+      { title:"BiS — check AMR offset 4084/4085", detail:"Readjust 4084 if the sensor/shaft relationship changed; 4085 normally 0." },
+      { title:"Ran fine before — chase noise", detail:"Motor-sensor count errors from noise are the prime suspect." },
+    ],
+    source:"B-65285EN §3.4.64" },
+  { code:"A", title:"Program ROM Error (A / A1 / A2)",
+    desc:"The control program is not running, or errored while running. At power-on: wrong software spec or bad PCB. While running: noise. CNC shows 749.",
+    steps:[
+      { title:"At power-on — check software / replace PCB", detail:"Wrong software specification or defective board — replace the SPM or its control PCB." },
+      { title:"While the motor is active — check noise", detail:"Check the grounding wire per B-65282EN 'Installation'; separate the spindle sensor signal wire from motor power wires." },
+    ],
+    source:"B-65285EN §3.4.65" },
+  { code:"A1", title:"Program ROM Error (A / A1 / A2)",
+    desc:"Same fault family as 'A' — control program not running or errored. See code A. CNC shows 749.",
+    steps:[
+      { title:"At power-on — replace the SPM or control PCB", detail:"Wrong software spec or defective board." },
+      { title:"While running — check grounding and routing", detail:"Per B-65282EN 'Installation'; separate sensor wires from power wires." },
+    ],
+    source:"B-65285EN §3.4.65" },
+  { code:"A2", title:"Program ROM Error (A / A1 / A2)",
+    desc:"Same fault family as 'A' — control program not running or errored. See code A. CNC shows 749.",
+    steps:[
+      { title:"At power-on — replace the SPM or control PCB", detail:"Wrong software spec or defective board." },
+      { title:"While running — check grounding and routing", detail:"Per B-65282EN 'Installation'; separate sensor wires from power wires." },
+    ],
+    source:"B-65285EN §3.4.65" },
+  { code:"C0", title:"CNC↔SP Communication Data Alarm",
+    desc:"Serial communication data error between CNC and SP. Check the serial cable, then replace the SPM or the CNC serial-spindle board. CNC shows SP9120.",
+    steps:[
+      { title:"Inspect the serial link cable/connectors", detail:"JA7B/JA41 link — damage, looseness, routing near power wiring." },
+      { title:"Replace the SPM or control PCB", detail:"The manual's first hardware suspect." },
+      { title:"Replace the CNC serial-spindle board/module", detail:"If the amp swap doesn't clear it." },
+    ],
+    source:"B-65285EN §3.4.67" },
+  { code:"C1", title:"CNC↔SP Communication Data Alarm",
+    desc:"Serial communication data error between CNC and SP — same family as C0. CNC shows SP9121.",
+    steps:[
+      { title:"Inspect the serial link cable/connectors", detail:"JA7B/JA41 link — damage, looseness, routing." },
+      { title:"Replace the SPM, then the CNC serial-spindle board", detail:"Per the C0 procedure." },
+    ],
+    source:"B-65285EN §3.4.67" },
+  { code:"C2", title:"CNC↔SP Communication Data Alarm",
+    desc:"Serial communication data error between CNC and SP — same family as C0. CNC shows SP9122.",
+    steps:[
+      { title:"Inspect the serial link cable/connectors", detail:"JA7B/JA41 link — damage, looseness, routing." },
+      { title:"Replace the SPM, then the CNC serial-spindle board", detail:"Per the C0 procedure." },
+    ],
+    source:"B-65285EN §3.4.67" },
+  { code:"C3", title:"Spindle Switching Circuit Error",
+    desc:"SPSL switching request vs submodule SW internal status mismatch. Replace the SSW. CNC shows SP9123.",
+    steps:[
+      { title:"Replace the submodule SW (SSW)", detail:"The manual's direct action. Verify SPSL sequence timing only if a new SSW reproduces it." },
+    ],
+    source:"B-65285EN §3.4.68" },
+  { code:"C4", title:"Invalid Learning Velocity Command",
+    desc:"Invalid learning cycle in time-sync learning control. Check the velocity command and parameter 4425 (20–4800). CNC shows SP9124.",
+    steps:[
+      { title:"Check the velocity command", detail:"Value must be appropriate for time-sync learning control." },
+      { title:"Check parameter 4425 (20–4800)", detail:"Correct the learning cycle if outside the range." },
+    ],
+    source:"B-65285EN §3.4.69" },
+  { code:"C5", title:"Invalid Dynamic-Compensation Degree",
+    desc:"Invalid highest/lowest degree of dynamic characteristic compensation Gx in learning control. Decrease 4427/4428. CNC shows SP9125.",
+    steps:[
+      { title:"Decrease parameter 4427 / 4428", detail:"Lower the highest (4427) or lowest (4428) degree until valid." },
+    ],
+    source:"B-65285EN §3.4.70" },
+  { code:"C7", title:"Invalid Learning Cycle (Angle Sync)",
+    desc:"Invalid reference-angle cycle in angle-sync learning control. Increase parameter 4425. CNC shows SP9127.",
+    steps:[
+      { title:"Increase parameter 4425", detail:"Raise the number of divisions per cycle until valid." },
+    ],
+    source:"B-65285EN §3.4.71" },
+  { code:"C8", title:"Sync: Excessive Speed Deviation",
+    desc:"Spindle-sync speed deviation exceeded parameter 4515. After excitation off/on → sequence bug; during cutting → overload or level. CNC shows SP9128.",
+    steps:[
+      { title:"After excitation off/on — fix the sequence", detail:"Turn excitation off only AFTER spindle sync is released — the catch-up move trips the alarm." },
+      { title:"During cutting — review load, then level 4515", detail:"Overload first; if none, check the detection level setting." },
+    ],
+    source:"B-65285EN §3.4.72" },
+  { code:"C9", title:"Sync: Excessive Position Error",
+    desc:"Spindle-sync position error exceeded parameter 4516. Same diagnosis as C8. CNC shows SP9129.",
+    steps:[
+      { title:"After excitation off/on — fix the sequence", detail:"Release sync before dropping excitation." },
+      { title:"During cutting — review load, then level 4516", detail:"Overload first; then the detection level." },
+    ],
+    source:"B-65285EN §3.4.73 (→ C8)" },
+  { code:"d0", title:"Tandem Speed Polarity Error",
+    desc:"Master/slave speed polarity abnormal in torque tandem control. Check rotation-direction setting (FS16: bit 2 of 4353). CNC shows SP9130.",
+    steps:[
+      { title:"Check the rotation-direction setting", detail:"FS16: bit 2 of parameter 4353 — must match the mechanical arrangement." },
+    ],
+    source:"B-65285EN §3.4.74" },
+  { code:"d1", title:"Spindle Adjustment Function Alarm",
+    desc:"Error during spindle-adjustment-function operation. Read the error and action on SERVO GUIDE. CNC shows SP9131.",
+    steps:[
+      { title:"Read the error on SERVO GUIDE", detail:"The tool displays the specific description and action for this run." },
+    ],
+    source:"B-65285EN §3.4.75" },
+  { code:"d2", title:"Serial Sensor Communication Lost",
+    desc:"Serial sensor ↔ SP communication disconnected. Params, amp support, cable, then the SPM. CNC shows SP9132.",
+    steps:[
+      { title:"Check sensor parameters", detail:"START-UP section of B-65280EN." },
+      { title:"First start — confirm SPM supports the sensor", detail:"'Parameters related to detectors' in B-65282EN." },
+      { title:"Check/replace the cable", detail:"The common cause on a machine that ran fine." },
+      { title:"Replace the SPM", detail:"If all above check out." },
+    ],
+    source:"B-65285EN §3.4.76" },
+  { code:"d3", title:"Serial Sensor Data Error (Noise)",
+    desc:"Serial sensor data corrupted by noise. Check the cable shielding and routing. CNC shows SP9133.",
+    steps:[
+      { title:"Check the cable shielding", detail:"Per B-65282EN 'Detectors' — continuity, termination, grounding." },
+      { title:"Check routing", detail:"Separate the sensor cable from motor power leads." },
+    ],
+    source:"B-65285EN §3.4.77" },
+  { code:"d4", title:"Serial Sensor Soft Phase Alarm",
+    desc:"Serial sensor position data jumped beyond the expected range. Start-up → params; previously-good machine → shielding. CNC shows SP9134.",
+    steps:[
+      { title:"Check sensor parameters", detail:"'Parameters Related to Start-up' in B-65280EN." },
+      { title:"Check the cable shielding", detail:"Per B-65282EN 'Detectors'." },
+    ],
+    source:"B-65285EN §3.4.78" },
+  { code:"d7", title:"SPM Device Communication Error",
+    desc:"Communication error in a device on the SP control circuit — usually a loose control PCB. CNC shows SP9137.",
+    steps:[
+      { title:"Check the control PCB mounting", detail:"Push the faceplate fully home; verify its connectors are engaged." },
+      { title:"Replace the SPM", detail:"If mounted correctly and the alarm persists." },
+    ],
+    source:"B-65285EN §3.4.79" },
+  { code:"d9", title:"Serial Sensor Internal Circuit Error",
+    desc:"Error in the inner circuit of the serial sensor. Replace the detection circuit. CNC shows SP9139.",
+    steps:[
+      { title:"Replace the detection circuit", detail:"The sensor's internal detection circuit is abnormal — replace the sensor unit." },
+    ],
+    source:"B-65285EN §3.4.80" },
+  { code:"E0", title:"Serial Sensor Pulse Count Error",
+    desc:"Pulse count between 1-rot signals of the serial sensor out of range. Replace the detection circuit. CNC shows SP9140.",
+    steps:[
+      { title:"Replace the detection circuit", detail:"Points inside the sensor's detection circuit." },
+    ],
+    source:"B-65285EN §3.4.81" },
+  { code:"E1", title:"Serial Sensor 1-Rot Not Detected",
+    desc:"No serial-sensor one-rotation signal within 5 rotations after power-on. Params (teeth), adjustment, then detection circuit. CNC shows SP9141.",
+    steps:[
+      { title:"Check sensor parameters", detail:"Invalid teeth count makes the calculated rotations never match — B-65280EN 'Start-up'." },
+      { title:"Adjust the sensor signal", detail:"Per B-65282EN 'Detectors'." },
+      { title:"Replace the detection circuit", detail:"If parameters and adjustment are good." },
+    ],
+    source:"B-65285EN §3.4.82" },
+];
+
+// ── SPM STATUS ERROR CODES (yellow ERR LED on the αiSP 2-digit display) ─
+// These are SEQUENCE / PARAMETER errors — a different class from alarms.
+// When one is active the ERR LED lights (ALM stays off) and the amp shows
+// the 2-digit error number. Also on the CNC diagnosis screen:
+//   DGN 710 (1st spindle) / 711 (2nd) / 730 (3rd) / 731 (4th); DGN 1561 on FS15i.
+// The motor is usually not activated until the sequence/parameter is fixed.
+const SPM_ERROR_DB = [
+  { code:"01", title:"Rotation commanded before ESP / MRDY ready",
+    desc:"SFR, SRV, or ORCM was input while *ESP (emergency stop) or MRDY (machine ready) was not yet established. Check the *ESP and MRDY sequence — mind parameter 4001#0 (whether MRDY is used)." },
+  { code:"03", title:"Cs command with no position sensor set",
+    desc:"A Cs contour control command was issued while the parameters say there is no position sensor (4002#3,2,1,0 = 0,0,0,0). Motor won't run. Correct parameter 4002." },
+  { code:"04", title:"Servo/sync command with no position sensor set",
+    desc:"A servo-mode command (rigid tap, Cs) or spindle-sync command was issued while 4002#3,2,1,0 = 0,0,0,0 (no position sensor). Motor won't run. Correct parameter 4002." },
+  { code:"05", title:"Orientation commanded without the option",
+    desc:"ORCM (orientation command) was input but the orientation-function parameter is not set. Check the orientation parameters." },
+  { code:"06", title:"Low-speed winding without output-switch option",
+    desc:"Low-speed winding is selected (RCH = 1) but the output-switching option parameter is not set. Check the output-switching parameter and the power-line status signal (RCH)." },
+  { code:"07", title:"Cs mode without a rotation command",
+    desc:"Cs contour control mode is input but neither SFR nor SRV is present. Check the sequence." },
+  { code:"08", title:"Servo mode without a rotation command",
+    desc:"Servo mode (rigid tapping or spindle positioning) is input but neither SFR nor SRV is present. Check the sequence." },
+  { code:"09", title:"Spindle sync without a rotation command",
+    desc:"Spindle synchronization control is input but neither SFR nor SRV is present. Check the sequence." },
+  { code:"10", title:"Mode conflict during Cs contour control",
+    desc:"Another mode (servo, spindle sync, or orientation) was specified while Cs contour control was running. Cancel Cs contour control before entering another mode." },
+  { code:"11", title:"Mode conflict during servo mode",
+    desc:"Another mode (Cs, spindle sync, or orientation) was specified while servo mode (rigid tap / positioning) was running. Cancel servo mode first." },
+  { code:"12", title:"Mode conflict during spindle sync",
+    desc:"Another mode (Cs, servo, or orientation) was specified while spindle synchronization was running. Cancel spindle sync first." },
+  { code:"13", title:"Mode conflict during orientation",
+    desc:"Another mode (Cs, servo, or spindle sync) was specified while orientation was running. Cancel orientation first." },
+  { code:"14", title:"SFR and SRV input at the same time",
+    desc:"Forward (SFR) and reverse (SRV) rotation signals are both input. Input only one of them." },
+  { code:"16", title:"Differential speed mode without the option",
+    desc:"DEFMD (differential speed mode command) is input but the differential-speed-control parameter is off (4000#5 = 0). Check the parameter and the command." },
+  { code:"17", title:"Speed-detector parameter invalid",
+    desc:"The speed-detector setting (4011#2,1,0) matches no available detector. Check parameter 4011." },
+  { code:"18", title:"Position-coder orientation, no position sensor set",
+    desc:"A position-coder-based orientation command was issued while 4002#3,2,1,0 = 0,0,0,0 (no position sensor). Check the parameter and the input signal." },
+  { code:"19", title:"Mode conflict during magnetic-sensor orientation",
+    desc:"Another mode (Cs, servo, or spindle sync) was specified while magnetic-sensor orientation was running. Cancel orientation first." },
+  { code:"21", title:"Tandem command while spindle sync enabled",
+    desc:"A tandem operation command was input while spindle synchronization control was enabled. Input the tandem command only when spindle sync is canceled." },
+  { code:"22", title:"Spindle sync while tandem enabled",
+    desc:"Spindle synchronization control was specified while torque tandem operation was enabled. Specify spindle sync only when torque tandem is canceled." },
+  { code:"23", title:"Tandem command without the option",
+    desc:"A tandem operation command was input without the required CNC software option. Check the torque-tandem option." },
+  { code:"24", title:"Absolute command after incremental orientation",
+    desc:"During continuous indexing in position-coder orientation, an absolute command (INCMD = 0) followed incremental operation (INCMD = 1). Perform an absolute-position-based orientation before an absolute command." },
+  { code:"26", title:"Spindle switch and 3-stage range both set",
+    desc:"Parameters are set to use both spindle switching and three-stage speed-range switching. Check the parameter settings and the input signal." },
+  { code:"29", title:"Shortest-time orientation not supported",
+    desc:"Shortest-time orientation is selected (4018#6 = 0 with 4320–4323 nonzero). The αi series does not support it — use the optimum orientation function instead." },
+  { code:"30", title:"Command before magnetic pole detection",
+    desc:"A command was input while the magnetic pole is undetected (EPFIXA = 0) — the motor can't be driven. Detect the pole (EPFIXA = 1) first. If EPFSTR = 1, commands are ignored even after detection; set EPFSTR to 0 once detection completes." },
+  { code:"31", title:"Spindle FAD function not supported by hardware",
+    desc:"This hardware configuration does not support the spindle FAD function; the motor is not activated. Check the CNC model." },
+  { code:"32", title:"Disturbance input without S0 in velocity mode",
+    desc:"The disturbance input function is enabled (4395#7 = 1) but S0 is not specified in velocity mode. Specify S0 in velocity mode before enabling disturbance input." },
+  { code:"33", title:"Spindle EGB function not supported by hardware",
+    desc:"This hardware configuration does not support the spindle EGB function; the motor is not activated. Check the CNC model." },
+  { code:"34", title:"FAD and EGB both enabled",
+    desc:"Both spindle FAD and spindle EGB are enabled; the motor is not activated. These cannot be used together — enable only one." },
+  { code:"35", title:"Spindle amplifier ID not obtained",
+    desc:"The spindle amplifier ID information could not be read. Replace the spindle amplifier with one that has correct ID information." },
+  { code:"36", title:"Submodule SM (SSM) fault",
+    desc:"The submodule SM is faulty — either the interface signal between the SP and the SSM is disconnected, or the SSM itself failed. See the SSM section of the αi Parameter Manual for the full action." },
+  { code:"37", title:"Current loop setting changed",
+    desc:"The current-loop setting (parameter 4012) was changed. Verify parameter 4012, then cycle power off and on." },
+  { code:"38", title:"Inter-amplifier communication parameter wrong",
+    desc:"A parameter for communication between spindle amplifiers is set incorrectly, or a function unavailable with torque tandem is set. Check the parameters." },
+  { code:"39", title:"DSCN input during motor excitation",
+    desc:"DSCN (disconnection-detection disable) was input while a motor-exciting command (SFR, SRV, or ORCM) was active. Do not input DSCN during a command that excites the motor." },
+  { code:"43", title:"Settings do not support αiCZ serial sensor",
+    desc:"The parameter settings do not support the αiCZ sensor (serial). Recheck the sensor parameters — the exact items depend on the spindle software series/edition (9D80)." },
+  { code:"44", title:"Control period setting not supported",
+    desc:"The spindle amplifier does not support the set control period. Check parameter 4012." },
+];
+
+// ── PSM AMPLIFIER ALARM CODES (single digit on αiPS 7-segment) ─────────────
+const PSM_ALARM_DB = [
+  { code:"1", title:"IPM / Overcurrent Input",
+    desc:"Input circuit overcurrent or IPM alarm. Check input voltage balance, AC reactor specification, and replace IPM or PSM if needed.", cnc:"437" },
+  { code:"2", title:"Control Fan Stopped",
+    desc:"Control circuit cooling fan inside PSM has stopped. Replace the fan on the control PCB.", cnc:"443" },
+  { code:"3", title:"Main Circuit Heatsink Overheat",
+    desc:"Main circuit heatsink temperature abnormal. Check main circuit fan, clean dust from cooling system, review load conditions.", cnc:"431" },
+  { code:"4", title:"DC Link Voltage Drop",
+    desc:"Main circuit DC link voltage dropped. Check input voltage, small power dip, or verify E-stop sequence.", cnc:"433" },
+  { code:"5", title:"Capacitor Charge Failure",
+    desc:"DC link capacitor not recharged within specified time. Check number of connected SVMs vs PSM capacity, DC link short-circuit, or bleed resistor.", cnc:"442" },
+  { code:"6", title:"Control Power Supply Voltage Drop",
+    desc:"Control power supply voltage decreased. Check input voltage supply.", cnc:"432" },
+  { code:"7", title:"DC Link Overvoltage",
+    desc:"DC link voltage abnormally high — excessive regenerated power or high output impedance on AC source.", cnc:"439" },
+  { code:"8", title:"Excessive Regenerative Power (αiPSR)",
+    desc:"Short-term regenerative power exceeded limit. Check regenerative resistance specification, or replace PSMR.", cnc:"605" },
+  { code:"A", title:"External Cooling Fan Stopped",
+    desc:"External dissipator cooling fan stopped. Replace fan. Check control PCB is fully seated.", cnc:"606" },
+  { code:"E", title:"Input Power Open Phase",
+    desc:"Input power supply has open phase. Check 3-phase input voltage and connections.", cnc:"607" },
+  { code:"H", title:"Regenerative Resistor Overheat (αiPSR)",
+    desc:"Regenerative resistor temperature abnormally high. Check wiring, resistor spec, reduce accel/decel duty, check cooling fan.", cnc:"440" },
+  { code:"P", title:"Communication Error Between Amplifiers",
+    desc:"Communication error between PSM and connected amplifiers. Check CXA2A connector and cable.", cnc:"604" },
+];
+
+// ── SVM AMPLIFIER ALARM CODES (single digit on αiSV 7-segment) ─────────────
+// Ordered by increasing 7-segment display value: digits first, each dotted
+// variant placed immediately after its base digit (8 → 8.), then hex/alpha
+// order (b, c, d, F) followed by the remaining letters (L, P, U).
+const SVM_ALARM_DB = [
+  { code:"1", title:"Internal Fan Stopped",
+    desc:"Internal inverter cooling fan stopped. Check for foreign material in fan, check fan connector, push faceplate fully home, replace fan or SVM.", cnc:"444" },
+  { code:"2", title:"Control Power Undervoltage",
+    desc:"24V control power supply from PSM is low. Check 3-phase input, check 24V output from PSM, check CXA2A/B cable.", cnc:"434" },
+  { code:"5", title:"DC Link Undervoltage",
+    desc:"DC link voltage dropped below minimum. Check input voltage, DC link bar connections, SVM failure.", cnc:"435" },
+  { code:"6", title:"Overheat",
+    desc:"Servo amplifier overheated. Check ambient temperature, cooling conditions, motor usage conditions.", cnc:"602" },
+  { code:"8", title:"DC Link Current Alarm (L axis)",
+    desc:"Abnormally large DC link current on L axis. Check motor power leads and windings for a short to ground; if clean, the SVM power stage has failed.", cnc:"600" },
+  { code:"8.", title:"IPM Alarm (L axis)",
+    desc:"IPM alarm on L axis. Check motor and power cable insulation, motor usage conditions.", cnc:"449 / 603" },
+  { code:"9", title:"DC Link Current Alarm (M axis)",
+    desc:"Abnormally large DC link current on M axis. Check motor power leads and windings for a short to ground; if clean, the SVM power stage has failed.", cnc:"600" },
+  { code:"9.", title:"IPM Alarm (M axis)",
+    desc:"IPM alarm on M axis. Check motor and power cable insulation, motor usage conditions.", cnc:"449 / 603" },
+  { code:"A", title:"DC Link Current Alarm (N axis)",
+    desc:"Abnormally large DC link current on N axis. Check motor power leads and windings for a short to ground; if clean, the SVM power stage has failed.", cnc:"600" },
+  { code:"A.", title:"IPM Alarm (N axis)",
+    desc:"IPM alarm on N axis. Check motor and power cable insulation, motor usage conditions.", cnc:"449 / 603" },
+  { code:"b", title:"Motor Current Alarm (L axis)",
+    desc:"Abnormally large motor current on L axis (inverter). Check motor and power-cable insulation for a short; verify motor-specific parameters.", cnc:"438" },
+  { code:"c", title:"Motor Current Alarm (M axis)",
+    desc:"Abnormally large motor current on M axis (inverter). Check motor and power-cable insulation for a short; verify motor-specific parameters.", cnc:"438" },
+  { code:"d", title:"Motor Current Alarm (N axis)",
+    desc:"Abnormally large motor current on N axis (inverter). Check motor and power-cable insulation for a short; verify motor-specific parameters.", cnc:"438" },
+  { code:"F", title:"Radiator Fan Stopped",
+    desc:"External dissipator fan stopped. Replace fan. Check fan connector.", cnc:"601" },
+  { code:"L", title:"FSSB Communication Error (COP10A)",
+    desc:"FSSB optical communication error at COP10A port. Check optical cable going into this SVM.", cnc:"460" },
+  { code:"P", title:"Amplifier-Module Communication Error",
+    desc:"Communication error between SVM and PSM. Check CXA2A/B connector and cable.", cnc:"604" },
+  { code:"U", title:"FSSB Communication Error (COP10B)",
+    desc:"FSSB optical communication error at COP10B port. Check optical cable, replace SVM or check CNC.", cnc:"462 / 463" },
+];
+
+// Normalize a spindle alarm number to its set of equivalent forms.
+// FANUC shows the same spindle fault three ways that techs use interchangeably:
+//   CNC screen "SP9056" / "9056"  ==  SPM 7-seg LED "56".
+// The 90NN CNC number and the NN LED code are the same alarm (NN = last two digits).
+// Also covers per-spindle CNC codes 7n01-7n99 (n = spindle number) -> LED NN.
+// Returns the array of numeric strings that should all resolve to one alarm.
+function spindleCodeForms(numStr) {
+  const forms = new Set([numStr]);
+  // 90NN  -> also NN   (SP9056 -> 56)
+  let m = numStr.match(/^90(\d{2})$/);
+  if (m) forms.add(m[1]);
+  // 7nNN  -> also NN   (7101/7201/7301/7401 spindle-N alarm -> LED NN)
+  m = numStr.match(/^7[1-4](\d{2})$/);
+  if (m) forms.add(m[1]);
+  // NN    -> also 90NN (56 -> 9056), the reverse direction
+  if (/^\d{2}$/.test(numStr)) forms.add("90" + numStr);
+  return [...forms];
+}
+
+// ── LOOKUP INDEXES — built ONCE at load, O(1) lookups ever after ──
+// The DBs are static, so every code→alarm and key→alarm resolution is
+// precomputed here instead of re-scanning 169 entries with regex work
+// on every call. Same match semantics as the old linear scans:
+//   • exact uppercase code match always wins
+//   • numeric queries (≥2 digits) also match via spindleCodeForms
+//     (9056 ⇄ 56 ⇄ 7n56) against each entry's numeric strip.
+const ALARM_ORDER  = new Map(ALARM_DB.map((a, i) => [a, i]));
+const ALARM_BY_KEY = new Map(ALARM_DB.map(a => [a.key, a]));
+const ALARM_CODE_INDEX = (() => {
+  const idx = new Map();
+  const add = (k, a) => {
+    const l = idx.get(k);
+    if (l) { if (!l.includes(a)) l.push(a); } else idx.set(k, [a]);
+  };
+  ALARM_DB.forEach(a => a.codes.forEach(code => {
+    const up = String(code).toUpperCase();
+    add(up, a);                       // exact form, e.g. "SV0401", "ER32"
+    const n = up.replace(/\D/g, "");
+    if (n) add("#" + n, a);           // numeric strip, e.g. "#401", "#9056"
+  }));
+  return idx;
+})();
+
+// Collect candidates for a query: exact form + numeric spindle forms.
+function alarmCandidatesForCode(raw) {
+  const c   = raw.trim().toUpperCase().replace(/\s/g, "");
+  const num = c.replace(/\D/g, "");
+  const cands = [];
+  const push = (l) => l && l.forEach(a => { if (!cands.includes(a)) cands.push(a); });
+  push(ALARM_CODE_INDEX.get(c));
+  if (num.length >= 2) spindleCodeForms(num).forEach(f => push(ALARM_CODE_INDEX.get("#" + f)));
+  return cands;
+}
+
+function findAlarmByCode(raw) {
+  const cands = alarmCandidatesForCode(raw);
+  if (!cands.length) return null;
+  // Preserve old behaviour: first match in DB order wins.
+  return cands.reduce((b, a) => (ALARM_ORDER.get(a) < ALARM_ORDER.get(b) ? a : b));
+}
+
+// Same match logic as findAlarmByCode, but returns EVERY matching card, not
+// just the first. Used to detect when one code belongs to more than one alarm
+// (e.g. "32" = spindle SP9032 AND PMC ER32) so we can offer both to the tech.
+function findAllAlarmsByCode(raw) {
+  return alarmCandidatesForCode(raw)
+    .slice()
+    .sort((a, b) => ALARM_ORDER.get(a) - ALARM_ORDER.get(b));
+}
+
+const findAlarmByKey    = (key) => ALARM_BY_KEY.get(key) || null;
+const findScenarioByKey = (key) => TROUBLESHOOTING_DB.find(s => s.key === key) || null;
+
+// Two amp codes are the same LED reading regardless of zero-padding:
+// PSM shows "3", SPM shows "03" for related faults; techs type either.
+// Compare on the numeric value when both sides are purely numeric.
+function ampCodeMatch(entryCode, searchCode) {
+  const e = entryCode.toUpperCase(), s = searchCode.toUpperCase();
+  if (e === s) return true;
+  // Purely numeric on both sides -> compare without leading zeros
+  if (/^\d+$/.test(e) && /^\d+$/.test(s)) {
+    return parseInt(e, 10) === parseInt(s, 10);
+  }
+  return false;
+}
+
+// Search all amplifier alarm DBs — returns [{unit, entry, cncAlarm}]
+// Handles bare codes ("2", "12", "8."), unit-qualified ("PS2","SV5","SP12"),
+// full CNC spindle numbers ("9056","SP9056" -> SPM LED "56"),
+// and zero-padding differences ("3" -> SPM "03").
+function findAmpAlarms(raw) {
+  const q = raw.trim().toUpperCase().replace(/\s/g, "");
+  if (!q) return [];
+
+  // Explicit error search: "ERR07" / "ER07" -> spindle STATUS errors only.
+  const errPrefix = q.match(/^ERR?(\d[\dA-Z.]*)$/);
+  if (errPrefix) {
+    const ec = errPrefix[1], ed = ec.replace(/\D/g, "");
+    return SPM_ERROR_DB
+      .filter(e => ampCodeMatch(e.code, ec) || (ed && ampCodeMatch(e.code, ed)))
+      .map(entry => ({ unit: "SPM", entry, cncAlarm: null, kind: "error" }));
+  }
+
+  // Check for unit prefix: PS/SV/SP followed by code
+  const prefixMatch = q.match(/^(PS|SV|SP)(.+)$/);
+  const unitMap = { PS: "PSM", SV: "SVM", SP: "SPM" };
+  const dbs = [["PSM", PSM_ALARM_DB], ["SVM", SVM_ALARM_DB], ["SPM", SPM_ALARM_DB]];
+  const results = [];
+  dbs.forEach(([unit, db]) => {
+    // If unit-qualified, only search matching unit
+    if (prefixMatch && unitMap[prefixMatch[1]] !== unit) return;
+    let searchCode = prefixMatch ? prefixMatch[2] : q;
+    // Spindle codes: a full CNC number like 9056 / SP9056 maps to LED 56.
+    const candidates = new Set([searchCode]);
+    const digits = searchCode.replace(/\D/g, "");
+    if (unit === "SPM" && digits && /^\d+$/.test(searchCode)) spindleCodeForms(digits).forEach(f => candidates.add(f));
+    db.forEach(entry => {
+      // αiPS (PSM) codes are always single characters (1–8, A, E, H) — match
+      // them exactly so a 2-digit spindle search like "04" doesn't collapse
+      // onto PS code "4". SVM/SPM keep the leading-zero-tolerant match ("3"→"03").
+      const hit = [...candidates].some(cand =>
+        unit === "PSM"
+          ? entry.code.toUpperCase() === cand.toUpperCase()
+          : ampCodeMatch(entry.code, cand));
+      if (hit) {
+        const cncNum = entry.cnc ? entry.cnc.split("/")[0].trim() : null;
+        const cncAlarm = cncNum ? findAlarmByCode(cncNum) : null;
+        results.push({ unit, entry, cncAlarm, kind: "alarm" });
+      }
+    });
+  });
+
+  // Spindle STATUS errors (ERR LED) — same 2-digit numbers as alarms, told
+  // apart on the unit by which LED is lit. Offer both for a spindle code.
+  const spQualified = prefixMatch && prefixMatch[1] === "SP";
+  if (!prefixMatch || spQualified) {
+    const ecode = spQualified ? prefixMatch[2] : q;
+    const ed = ecode.replace(/\D/g, "");
+    SPM_ERROR_DB.forEach(entry => {
+      if (ampCodeMatch(entry.code, ecode) || (ed && ampCodeMatch(entry.code, ed))) {
+        results.push({ unit: "SPM", entry, cncAlarm: null, kind: "error" });
+      }
+    });
+  }
+  return results;
+}
+
+// ── DERIVED CNC ⇄ AMP CROSS-REFERENCE ────────────────────────────
+// One source of truth = the `cnc` field on each amp DB entry.
+// We invert it once at load so any CNC alarm number resolves to the
+// 7-seg reading(s) a tech sees on the PSM/SVM faceplate — and back —
+// with no duplicated data to drift out of sync. This is why searching
+// "433" surfaces "PS 4", and "PS 4" resolves to SV0433: same fact,
+// derived both directions from the single `cnc:"433"` on αiPS code 4.
+const CNC_TO_AMP = (() => {
+  const map = {};
+  const push = (num, unit, entry) => {
+    if (!num) return;
+    (map[num] = map[num] || []).push({ unit, code: entry.code, title: entry.title });
+  };
+  [["PSM", PSM_ALARM_DB], ["SVM", SVM_ALARM_DB]].forEach(([unit, db]) => {
+    db.forEach(entry => {
+      if (!entry.cnc) return;
+      // A single LED reading can carry more than one CNC number ("449 / 603").
+      entry.cnc.split("/").forEach(part => push(part.replace(/\D/g, ""), unit, entry));
+    });
+  });
+  return map;
+})();
+
+// Servo/position alarms the amplifier has no code for — the SVM STATUS
+// display just shows "-" (drive is healthy; the fault is raised CNC-side).
+// Dennis-confirmed set; extend as more are verified against real units.
+const SVM_DASH_ALARMS = new Set(["410", "417", "430", "436"]);
+
+// The five faults that light TWO faceplates at once: one physical αiPS converter
+// fault, reported on both the PS (αiPS) display and the spindle (SP) display.
+// Per B-65285EN §2.2.2 spindle-alarm cross-reference (SP + PS columns).
+// SINGLE SOURCE OF TRUTH — redirect, cross-reference, and search pairing all
+// derive from this, so the two 7-seg codes a tech actually sees stay together.
+const PS_SP_COMBINED = [
+  { sp:"04", ps:"E", spKey:"sp9004", psKey:"sv607" }, // input open phase
+  { sp:"11", ps:"7", spKey:"sp9011", psKey:"sv439" }, // DC link overvoltage
+  { sp:"30", ps:"1", spKey:"sp9030", psKey:"sv437" }, // input overcurrent
+  { sp:"33", ps:"5", spKey:"sp9033", psKey:"sv442" }, // DC link precharge failure
+  { sp:"51", ps:"4", spKey:"sp9051", psKey:"sv433" }, // DC link undervoltage
+  { sp:"57", ps:"H", spKey:"sp9057", psKey:"sv440" }, // regen resistor overheat / excess decel power
+  { sp:"58", ps:"3", spKey:"sp9058", psKey:"sv431" }, // converter main circuit overload
+  { sp:"59", ps:"2", spKey:"sp9059", psKey:"psfan" }, // converter cooling fan stopped
+  { sp:"b1", ps:"6", spKey:"sp9111", psKey:"sv432" }, // control power supply low voltage
+  { sp:"b2", ps:"8", spKey:"sp9112", psKey:"sv605" }, // excessive regenerative power
+  { sp:"b3", ps:"A", spKey:"sp9113", psKey:"sv606" }, // converter radiator fan stopped
+];
+const combinedBySp = (code) => PS_SP_COMBINED.find(c => c.sp === code) || null;
+const combinedByPs = (code) => PS_SP_COMBINED.find(c => c.ps === code) || null;
+
+// Derived: SPM 7-seg code → αiPS 7-seg code (used by the amp cross-reference).
+const SP_CONVERTER_PS = {};
+// Derived: SP card key → { psKey, ps } (used by the redirect banner + chip retarget).
+const SP_CONVERTER_REDIRECT = {};
+PS_SP_COMBINED.forEach(c => {
+  SP_CONVERTER_PS[c.sp] = c.ps;
+  SP_CONVERTER_REDIRECT[c.spKey] = { psKey: c.psKey, ps: c.ps };
+});
+
+// Derived: CNC alarm number (e.g. "9111") → combined pair. Needed for the
+// converter faults whose SPM 7-seg code is NOT a plain 90+NN of the CNC number
+// (SP9111→b1, SP9112→b2, SP9113→b3) — numeric stripping alone misses those.
+const CNC_NUM_TO_SPCOMBINED = {};
+PS_SP_COMBINED.forEach(c => {
+  const card = findAlarmByKey(c.spKey);
+  if (card) card.codes.forEach(code => {
+    const n = code.replace(/\D/g, "");
+    if (n) CNC_NUM_TO_SPCOMBINED[n] = c;
+  });
+});
+
+// Every amp 7-seg equivalent for a CNC alarm's code list.
+// PSM/SVM come from the inverted index above; SPM is structural
+// (spindle CNC 90NN / 7nNN == SPM LED NN, via spindleCodeForms).
+// `type` gates the lookup: PMC and pure control-side alarms have no amp
+// code at all, and a bare 2-digit PMC number must never be mistaken for a
+// spindle LED code (e.g. PMC "ER32" is not SPM LED 32).
+// Cached: codes arrays are stable references from the static DBs, so each
+// alarm's xref is computed once and reused on every list render thereafter.
+const _xrefCache = new Map();
+function ampXrefForCodes(codes, type) {
+  const hit = _xrefCache.get(codes);
+  if (hit && hit.t === type) return hit.o;
+  const o = _computeAmpXref(codes, type);
+  _xrefCache.set(codes, { t: type, o });
+  return o;
+}
+
+function _computeAmpXref(codes, type) {
+  if (type === "PMC") return [];
+  const out = [], seen = new Set();
+  const add = (unit, code, title, dash) => {
+    const k = unit + ":" + code;
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push({ unit, code, title, dash: !!dash });
+  };
+  (codes || []).forEach(raw => {
+    const num = String(raw).replace(/\D/g, "");
+    if (!num) return;
+    // Combined converter faults: show BOTH faceplates (SPM 7-seg + αiPS code),
+    // driven straight off PS_SP_COMBINED so codes like SP9111→b1/PS6 work even
+    // though the SPM code isn't a numeric strip of the CNC number.
+    const combo = CNC_NUM_TO_SPCOMBINED[num];
+    if (combo) {
+      const se = SPM_ALARM_DB.find(x => x.code === combo.sp);
+      if (se) add("SPM", se.code, se.title);
+      const pe = PSM_ALARM_DB.find(x => x.code === combo.ps);
+      if (pe) add("PSM", pe.code, pe.title);
+    }
+    (CNC_TO_AMP[num] || []).forEach(a => {
+      add(a.unit, a.code, a.title);
+      // If this is a combined PS+SP fault, also show the spindle faceplate the
+      // tech sees lit at the same time (PS card shows both, same as the SP card).
+      if (a.unit === "PSM") {
+        const pair = combinedByPs(a.code);
+        if (pair) {
+          const se = SPM_ALARM_DB.find(x => x.code === pair.sp);
+          if (se) add("SPM", se.code, se.title);
+        }
+      }
+    });
+    // Spindle numbers map to a 2-digit SPM LED code — spindle alarms only.
+    if (type === "SP" || /^SP/i.test(String(raw)) || /^(90|7[1-4])\d{2}$/.test(num)) {
+      spindleCodeForms(num).forEach(f => {
+        if (/^\d{2}$/.test(f)) {
+          const e = SPM_ALARM_DB.find(x => x.code === f);
+          if (e) add("SPM", e.code, e.title);
+          // Converter-side spindle alarms light TWO faceplates: the SPM shows
+          // the spindle number, the αiPS converter shows its own code. Same
+          // physical fault, reported through the spindle path.
+          const ps = SP_CONVERTER_PS[f];
+          if (ps) {
+            const pe = PSM_ALARM_DB.find(x => x.code === ps);
+            if (pe) add("PSM", pe.code, pe.title);
+          }
+        }
+      });
+    }
+    // Servo-side alarms with no amp code — SVM shows a dash.
+    if (SVM_DASH_ALARMS.has(num)) {
+      add("SVM", "-", "No amp fault code — drive OK, alarm is on the CNC/servo side", true);
+    }
+  });
+  return out;
+}
+
+// ── ALARM CATEGORY CLASSIFICATION (for the Browse library) ────────
+// Five library shelves: PS (converter/power supply), SP (spindle),
+// SVM (servo amp + motor + inverter), PMC (ladder/sequence), NC (everything else).
+// Converter faults carry SV numbers but belong on the PS shelf.
+// Converter faults carry SV/CNC numbers but belong on the PS shelf.
+// 443/610 = converter (CNV) cooling-fan failure = PS 7-seg "2".
+const PS_CONVERTER_CODES = ["431","432","433","437","439","440","442","443","610","605","606","607"];
+function alarmCategory(a) {
+  if (a.type === "PMC") return "PMC";
+  if (a.type === "SP") return "SP";
+  if (a.type === "SV") {
+    const firstNum = (a.codes || []).map(c => c.replace(/\D/g, "")).find(Boolean);
+    if (firstNum && PS_CONVERTER_CODES.includes(firstNum)) return "PS";
+    return "SVM";
+  }
+  // OT, OH, PS-parameter, and anything else = NC (control-side)
+  return "NC";
+}
+
+// Category → accent colour, shared by the Browse tiles and the alarm cards
+// so a spindle alarm is blue everywhere, a servo alarm red, etc.
+const CAT_COLORS = { PS: C.fanuc, SP: C.blue, SVM: C.red, NC: C.green, PMC: "#c084fc" };
+const catColor = (a) => CAT_COLORS[alarmCategory(a)] || C.fanuc;
+
+// All entries are skeleton stubs — content to be filled in.
+const TROUBLESHOOTING_DB = [
+  // ── POWER & STARTUP ─────────────────────────────────────────
+  { key:"ts_lcd_blank", category:"Power & Startup",
+    title:"Nothing displayed on LCD at power-on",
+    summary:"Screen black or locked at startup — LCD cable, backlight, software, or main board",
+    context:"If the screen is completely black or frozen on 'GRAPHIC IS READY' or the slot status screen, the display system is not initializing. B-64115EN §8.7.",
+    steps:[
+      { title:"Check motherboard LED status",
+        detail:"Refer to the hardware chapter for LED on/off patterns. If the main board has started normally and LEDs show normal operation → the fault is in the display system (cable, inverter board). If LEDs are locked mid-startup → hardware or missing software." },
+      { title:"Check LCD and backlight cable connections",
+        detail:"Verify both cables are firmly seated in their connectors on the main board. These are connected at the factory but can come loose during maintenance." },
+      { title:"Check that required software is installed",
+        detail:"If necessary software is not stored in the FROM module, the CNC won't start up. Verify FROM contents." },
+      { title:"Reseat card PCBs on the main board",
+        detail:"Check that display control card, CPU card, and axis control card are fully engaged with the main board connectors. Poor contact prevents startup." },
+      { title:"Replace boards in order",
+        detail:"If reseating doesn't help: replace display control card first, then CPU card, then main board. For B52n/B53n units: replace axis control card first, then main board." },
+    ] },
+  { key:"ts_psm_pil_off", category:"Power & Startup",
+    title:"PSM PIL LED is off",
+    summary:"αiPS power-on indicator LED dark — control power supply or 24V chain issue",
+    context:"The PIL LED runs on the internal +5V supply. If it's dark, the PS isn't getting control power or there's a short on the 24V output. B-65285EN §4.1.3.",
+    steps:[
+      { title:"Check AC control power at CX1A",
+        detail:"Verify 200VAC is connected to connector CX1A on the Power Supply. If power is connected to CX1B by mistake, fuse F2 (FU2) blows — correct the connection to CX1A." },
+      { title:"Check fuses F1 and F2 on the control PCB",
+        detail:"If a fuse is blown, replace it. If it blows again immediately after replacement, the control PCB is faulty — replace the board." },
+      { title:"Check for 24V output short circuit",
+        detail:"Check whether the 24V power output is short-circuited or a load exceeding the rating is connected. Disconnect CXA2A and CX4 to isolate the source." },
+      { title:"Check +5V control power voltage",
+        detail:"The PIL LED operates on the internal +5V supply. If the control power voltage is present but the PIL is still dark, the power supply circuit on the PCB, driver board, or power distribution board is faulty — replace." },
+    ] },
+  { key:"ts_mcc_no_close", category:"Power & Startup",
+    title:"Main MCC does not switch on",
+    summary:"E-stop released and CNC ready but MCC won't close — sequence, coil, or auxiliary fault",
+    context:"The Power Supply controls the MCC via relay output on CX3. Work through this sequence from the manual (B-65285EN §4.1.4) to isolate the cause.",
+    steps:[
+      { title:"Check E-stop status",
+        detail:"System may still be in emergency stop. Verify E-stop is fully released and the *ESP signal is high. Check the connection at CX4 on the Power Supply." },
+      { title:"Check CXA2A/B connector coupling",
+        detail:"If '−' blinks for ~2 seconds or 'P' is displayed after E-stop release, there's a connector problem. Verify CXA2A on the PS is connected to CXA2B on the first SV/SP, and the chain continues correctly through all amplifiers." },
+      { title:"Check interface cable between PS and SV/SP",
+        detail:"If connectors are in the right locations, the cable itself may be defective. Check or replace the CXA2A/B interface cable." },
+      { title:"Check MCC coil power supply",
+        detail:"If '−' blinks for ~2 seconds after E-stop release, the magnetic contactor drive power may not be supplied. Measure voltage across both ends of the MCC coil." },
+      { title:"Check MCC relay on PS — CX3 pins 1 and 3",
+        detail:"Verify the relay circuit between CX3-1 and CX3-3 opens and closes correctly when E-stop is released/applied. If the relay doesn't switch, the PS relay circuit is faulty." },
+      { title:"Replace the defective module",
+        detail:"If relay and coil power are OK, the Power Supply, Servo Amplifier, or Spindle Amplifier may be defective. Isolate by disconnecting units from the CXA2A/B chain one at a time." },
+    ] },
+  { key:"ts_spm_pil_off", category:"Power & Startup",
+    title:"SPM PIL LED is off (spindle amp)",
+    summary:"Spindle amplifier power-on indicator dark — control power, cable, fuse, or PCB",
+    context:"The SP PIL LED indicates 24V control power is reaching the unit through the CXA2A/B daisy chain. B-65285EN §4.3.2.1.",
+    steps:[
+      { title:"Check Power Supply PIL first",
+        detail:"If the PS PIL lamp is also off, the problem is upstream — 200V control power not reaching the PS. Check CX1A cable and breaker." },
+      { title:"PS PIL is on — check CXA2A/B cable to SP",
+        detail:"The 24V chain runs from PS through all amps. Check the CXA2A/B cable and connector at each unit between the PS and this SP." },
+      { title:"Detach all cables except CXA2A/B — check PIL",
+        detail:"If PIL comes on with other cables disconnected, an external connection is shorting the 24V line. Reconnect cables one at a time to find the short." },
+      { title:"Check for blown fuse on SP control PCB",
+        detail:"If fuse is blown and the PCB may be faulty, replace the unit." },
+      { title:"Replace the SP unit",
+        detail:"If PIL stays dark with only CXA2A/B connected and no blown fuse visible, the SP control PCB power supply circuit is defective." },
+    ] },
+  { key:"ts_spm_dash_blink", category:"Power & Startup",
+    title:"SPM STATUS shows blinking '--'",
+    summary:"Spindle amp waiting for serial communication / parameter loading — CNC not communicating or cable fault",
+    context:"After control power-on, the SP displays its software series and version for ~1 sec each, then blinks '--' while waiting for the CNC to establish serial communication and load parameters. If it stays blinking, the CNC link is not completing. B-65285EN §4.3.2.2.",
+    steps:[
+      { title:"No spindle communication alarm on CNC",
+        detail:"If the CNC shows no alarm, check whether the CNC software option for serial spindle is enabled. Also check bit settings — the CNC may not be configured to talk to this SP." },
+      { title:"Communication alarm IS shown on CNC — check cable type",
+        detail:"The cable between CNC and SP for electric connection vs optical adapter are different specifications. Verify the correct cable type is used for the connection method." },
+      { title:"Check cable connector housing",
+        detail:"Inspect the serial communication cable connector for damage, bent pins, or loose housing. Repair or replace the cable." },
+      { title:"Replace SP control PCB",
+        detail:"If cable is correct and good, the SP serial communication interface is faulty. Replace the unit or control PCB." },
+      { title:"Dual Check Safety — check K76 on second spindle",
+        detail:"If using Dual Check Safety and CNC alarm 756 or 766 appears, verify K76 jumper is mounted on JA7A of the second spindle amplifier. K76 is not needed for single-spindle machines." },
+    ] },
+  { key:"ts_svm_status", category:"Power & Startup",
+    title:"How to read SVM STATUS codes",
+    summary:"Servo amp 7-segment code meanings — standby, ready, alarm, and VRDY-OFF diagnosis",
+    context:"The 7-segment LED on the SV faceplate tells you exactly where the amplifier is in its startup sequence. B-65285EN §4.2.1 / §4.2.2.",
+    steps:[
+      { title:"LED is off — no control power",
+        detail:"Control power (24V via CXA2A/B from the PS) has not been supplied, the cable is faulty, or the SV control power circuit is defective." },
+      { title:"'−' blinking — control power short or cable fault",
+        detail:"The SV 24V control supply is being dragged down. Usually a feedback cable (JF*) short or motor encoder fault. Disconnect JF* to isolate." },
+      { title:"'−' steady — waiting for CNC READY signal",
+        detail:"The SV has control power but the CNC has not sent the READY command. Normal during startup. If it stays here, the CNC isn't communicating — check FSSB optical cables (COP10A/B)." },
+      { title:"Number displayed (no alarm) — axis number, ready/running",
+        detail:"During normal operation the SV shows its axis address. The motor is excited and responding to commands." },
+      { title:"Number or letter + ALM LED red — alarm state",
+        detail:"The displayed character is the alarm code. Cross-reference with the amplifier alarm codes (1,2,5,6,8,F,P,U,L,b,c,d, etc.)." },
+      { title:"VRDY-OFF on CNC — check DGN 358",
+        detail:"If CNC shows VRDY-OFF alarm, read DGN 358 (V ready-off info). Convert to binary and check bits 5→14 sequentially from lowest. The first bit that's NOT 1 identifies which startup step failed: bit6=*ESP, bits7-9=MCON, bit10=CRDY (PS ready), bit11=RLY (DB relay), bit12=INTL, bit13=DRDY." },
+      { title:"DGN 358 common values",
+        detail:"417 = still in E-stop (check CX4 on PS, check CXA2A/B cable). 993 = PS CRDY not output (check input power, MCC coil, CX3 on PS). 4065 = interlock not input (check DBM connection or replace SV). 97 = axis detach function is set." },
+    ] },
+  { key:"ts_vrdy_off", category:"Power & Startup",
+    title:"VRDY-OFF alarm on CNC screen",
+    summary:"Servo system not reaching ready state — DGN 358 pinpoints exactly which step failed",
+    context:"VRDY-OFF means the servo amplifier ready handshake did not complete. DGN 358 shows a binary sequence of startup bits — the first bit that's NOT set tells you where it stalled. B-65285EN §4.2.2.",
+    steps:[
+      { title:"Read DGN 358 on the CNC diagnosis screen",
+        detail:"SYSTEM → DGN → search 358. Note the decimal value displayed." },
+      { title:"Convert to binary — check bits 5 to 14",
+        detail:"Each bit represents a startup step that must complete in sequence. When all bits 5–14 are 1, the amp is ready. The first 0 bit (from bit 5 upward) is where the process stalled." },
+      { title:"DGN 358 = 417 → E-stop not released",
+        detail:"Check the E-stop signal at CX4 on the Power Supply. Check CXA2A/B communication cable is OK." },
+      { title:"DGN 358 = 993 → PS CRDY not output",
+        detail:"Power Supply preparation not completed. Check: (1) CXA2A/B cable. (2) Input power supply connected. (3) MCC coil power at CX3 on PS." },
+      { title:"DGN 358 = 4065 → interlock signal missing",
+        detail:"DB relay not energized. If using a Dynamic Brake Module (DBM): check connection between SV and DBM, check CX1A/B between PS and SV, check fuse FU2 on PS control PCB. If no DBM → replace SV." },
+      { title:"DGN 358 = 97 → axis detach function set",
+        detail:"The CNC has axis detach enabled, suppressing the MCON signal. Check parameter settings for axis detach." },
+      { title:"DGN 358 = 225, 481, 2017, or 8161 → replace SV",
+        detail:"These values indicate internal SV faults with no further isolation possible. Replace the Servo Amplifier." },
+    ] },
+  { key:"ts_sp_status_error", category:"Spindle Behavior",
+    title:"SP ERR LED on — Status Error codes",
+    summary:"Yellow ERR LED lit with error code = sequence or parameter mistake, not hardware fault",
+    context:"Status errors are NOT alarms — they indicate the CNC/ladder is sending an invalid command combination to the SP. The SP refuses to act and displays the error code. Check CNC DGN 710/711. B-65285EN §4.3.3.",
+    steps:[
+      { title:"Read the error code on the SP display",
+        detail:"The yellow ERR LED lights and the 7-segment shows a 2-digit error code. Also visible on CNC diagnosis screen: DGN 710 (1st spindle), 711 (2nd), 730 (3rd), 731 (4th)." },
+      { title:"Error 01 — command without ready signals",
+        detail:"SFR/SRV/ORCM is issued but *ESP or MRDY is not active. Check *ESP and MRDY sequences. For MRDY, check P4001 bit0 (whether MRDY signal is used)." },
+      { title:"Error 03/04/18 — position control command without sensor",
+        detail:"Cs contour, servo mode (rigid tap/positioning), or pulsecoder orientation commanded but P4002 bits 3-0 = 0000 (no position sensor configured). Set the correct sensor parameter." },
+      { title:"Error 05 — orientation without option parameter",
+        detail:"ORCM is input but orientation option parameters are not set. Configure orientation parameters." },
+      { title:"Error 07/08/09 — mode command without SFR/SRV",
+        detail:"Cs contour, servo mode, or spindle sync commanded but no forward/reverse rotation signal. Check the PMC sequence — SFR or SRV must be ON before entering these modes." },
+      { title:"Error 10/11/12/13 — conflicting operation modes",
+        detail:"Two modes active at the same time (e.g. Cs + sync, servo mode + orientation). Cancel the current mode before entering another." },
+      { title:"Error 14 — SFR and SRV both active",
+        detail:"Forward and reverse signals are ON simultaneously. Check the sequence — only one can be active." },
+      { title:"Error 17 — invalid speed detector parameter",
+        detail:"P4011 bits 2-0 don't match any known speed detector type. Check the setting." },
+      { title:"Error 30 — magnetic pole not detected (BiS motors)",
+        detail:"Motor command issued but EPFIXA=0 (pole not detected). Run pole detection first. After detection, set EPFSTR to 0 or the motor stays locked." },
+    ] },
+
+  // ── NO MOTION / OPERATION ───────────────────────────────────
+  { key:"ts_no_manual_auto", category:"No Motion / Operation",
+    title:"No manual OR auto operation",
+    summary:"Machine accepts no movement commands at all — E-stop, reset, mode, interlock, or servo fault",
+    context:"When nothing moves in any mode, the fault is common to all operation types. Work through E-stop → reset → mode → interlock → servo. B-64115EN §8.2.",
+    steps:[
+      { title:"Check for E-stop status",
+        detail:"If CNC status shows EMG, the emergency stop signal is active. Check PMC signal: G0008 bit4 (*ESP). When *ESP=0, E-stop is input. Trace the E-stop chain to find the open contact." },
+      { title:"Check for reset status",
+        detail:"If CNC shows RESET: check G0008 bit7 (ERS = external reset) and bit6 (RRW = reset & rewind). If both are 0, the MDI RESET key may be stuck — test key contact with a tester." },
+      { title:"Check mode select signal",
+        detail:"The mode must be displayed on the CNC status line (JOG, HND, MDI, MEM, EDIT). If nothing shows, mode select signal is missing. Check G0043 bits MD4/MD2/MD1: JOG=1,0,1 / HND=1,0,0 / MDI=0,0,0 / MEM=0,0,1." },
+      { title:"Check DGN 000–015 for hold conditions",
+        detail:"DGN 003=1: in-position check not completing (check DGN 300 position error vs P1826 in-position width, verify P1825 servo loop gain = 3000). DGN 005=1: interlock or start lock active. DGN 013=1: jog override at 0%. DGN 014=1: NC in reset state." },
+      { title:"Check interlock signals",
+        detail:"Multiple interlock types exist — check P3003 bits to see which are enabled. ITL (bit0): check G0008 bit0 (*IT=0 means active). ITX (bit2): check G0130 (*ITn=0 means active per axis). DIT (bit3): check G0132/G0134 (±MITn per axis and direction)." },
+      { title:"Check machine lock signal",
+        detail:"If position display (machine coordinate) doesn't update: G0044 bit0 (MLK) or G0108 bits MLK1-4 may be active. When =1, the corresponding machine lock is engaged." },
+    ] },
+  { key:"ts_no_jog", category:"No Motion / Operation",
+    title:"Jog operation cannot be done",
+    summary:"Auto/MPG works but jog mode does nothing — mode select, axis select, override, or feed per rev",
+    context:"If auto and MPG work but jog doesn't, the fault is specific to jog mode signals. B-64115EN §8.3.",
+    steps:[
+      { title:"Check JOG mode is selected",
+        detail:"CNC status must show JOG. If not, check mode select signal G0043: MD4/MD2/MD1 must be 1/0/1 for JOG mode." },
+      { title:"Check axis/direction select signal",
+        detail:"PMC signals G0100 (+J1 to +J4) and G0102 (-J1 to -J4) select axis and direction. When the +X button is pressed, +J1 should read 1. NOTE: This signal is edge-triggered — if the direction signal was active before entering JOG mode, it won't move. Set to 0 then re-activate." },
+      { title:"Check DGN 000–015 for hold conditions",
+        detail:"Same diagnostic checks as 'No manual/auto' — DGN 003 (in-position), DGN 005 (interlock), DGN 013 (jog override 0%), DGN 014 (reset state)." },
+      { title:"Check jog feedrate parameter P1423",
+        detail:"If the jog feedrate per axis is set to 0, the axis won't move in jog mode." },
+      { title:"Check feed per revolution mode (T series)",
+        detail:"If P1402 bit3 (JRV)=1, jog feed is synchronized with spindle rotation. The axis won't move unless the spindle is rotating. If the spindle is rotating but still no motion → check position coder and cable." },
+      { title:"Check index table axis (M series)",
+        detail:"The index table indexing axis (B-axis) cannot be jogged, incrementally fed, or handle-fed. This is by design." },
+    ] },
+  { key:"ts_no_mpg", category:"No Motion / Operation",
+    title:"Manual handle (MPG) operation cannot be done",
+    summary:"Jog and auto work but handwheel does nothing — servo not active, cable, I/O allocation, or signal",
+    context:"Four main causes: servo not activated, MPG cable fault, I/O module allocation wrong, or input signal missing. B-64115EN §8.4.",
+    steps:[
+      { title:"Check servo is activated",
+        detail:"SVM LED must show '0' (axis number). Any other display means the servo is not excited — jog and auto also won't work. Check servo parameters and wiring." },
+      { title:"Check MPG cables for breaks or shorts",
+        detail:"Examine cables from MPG to the I/O module JA3 connector. Use an oscilloscope on the MPG screw terminals (HA, HB, +5V, 0V). When rotated, HA and HB should show clean square waves with 90° phase difference and 1:1 on/off ratio." },
+      { title:"Check I/O link allocation for MPG module",
+        detail:"If the I/O module isn't allocated for manual pulse generator use, pulses won't reach the CNC. Check on PMC screen: [EDIT] → [MODULE]. If multiple modules support MPG, only the one nearest the CNC in the I/O link chain is effective — unless it's allocated NOT to use MPG, in which case the next one becomes active." },
+      { title:"Check HND mode is selected",
+        detail:"CNC status must show HND. Check G0043: MD4/MD2/MD1 must be 1/0/0 for handle mode." },
+      { title:"Check axis select signal for handle feed",
+        detail:"G0018 bits HS1A-D select the axis for MPG #1. Code: 0001=1st axis, 0010=2nd, 0011=3rd, 0100=4th. If all zeros, no axis is selected." },
+      { title:"Check multiplication and direction parameters",
+        detail:"G0019 bits MP1/MP2 set the handle feed multiplier (×1/×10/×100/×1000). P7102 bit0 (HNGx) reverses the handle rotation direction. P7110 sets the number of MPGs used (1 to 3)." },
+    ] },
+  { key:"ts_no_auto", category:"No Motion / Operation",
+    title:"Auto operation cannot be done",
+    summary:"Jog/MPG work but program won't start — mode, cycle start, feed hold, FIN signal, or override",
+    context:"If manual modes work, the servo system is OK. The fault is in the auto operation chain: mode → cycle start → feed hold → auxiliary function → override. B-64115EN §8.5.",
+    steps:[
+      { title:"Check manual operation first",
+        detail:"If manual jog also doesn't work, fix that first — see 'Jog operation cannot be done'. Auto requires a working servo system." },
+      { title:"Cycle start LED not lit — check mode select",
+        detail:"Status must show MEM, MDI, or RMT. Check G0043: MEM = MD4/MD2/MD1 = 0/0/1. If DNCI (bit5) is also 1 → Remote mode." },
+      { title:"Cycle start LED not lit — check cycle start signal",
+        detail:"G0007 bit2 (ST): this signal goes 1 when pressed, 0 when released. The cycle start actuates on the 1→0 transition. If it never goes to 1, the button or wiring is faulty." },
+      { title:"Cycle start LED not lit — check feed hold signal",
+        detail:"G0008 bit5 (*SP): normally 1 when feed hold button is NOT pressed. If *SP=0, feed hold is active — check button, wiring." },
+      { title:"Cycle start LED IS lit but nothing moves — check DGN 000–015",
+        detail:"DGN 000=1: waiting for auxiliary function FIN signal. Check FIN (G0004 bit3). For high-speed interface: check MFIN/SFIN/TFIN (G0005). DGN 004=1: feedrate override at 0% (check G0012 *FV0-7). DGN 005=1: interlock. DGN 006=1: waiting for spindle speed arrival (G0029 bit4 SAR, enabled by P3708 bit0)." },
+      { title:"Only rapid traverse (G00) doesn't work",
+        detail:"Check P1420 (rapid traverse rate per axis). Check rapid traverse override signals G0014 bits ROV1/ROV2. Check P1421 (F0 override rate)." },
+      { title:"Only cutting feed doesn't work",
+        detail:"Check P1422 (max feedrate — clamps the rate). If feed per revolution (mm/rev): check position coder is rotating (broken timing belt, loose coupling, connector). If thread cutting: same position coder checks." },
+    ] },
+  { key:"ts_cycle_start_off", category:"No Motion / Operation",
+    title:"Cycle start LED has turned off (mid-program)",
+    summary:"Program was running, now stopped — check DGN 020–025 to identify which event killed the cycle",
+    context:"DGN 020–025 record exactly why the cycle start LED (STL) turned off. Read them immediately — the bits tell you the cause. B-64115EN §8.6.",
+    steps:[
+      { title:"Read DGN 020–025 on the CNC",
+        detail:"Each diagnostic number corresponds to a stage in the cycle stop sequence. Read which bits are set to 1 — these identify the cause." },
+      { title:"E-stop signal input",
+        detail:"Check X1008 bit4 (*ESP) and G0008 bit4 (*ESP). *ESP=0 means emergency stop is active." },
+      { title:"External reset signal input",
+        detail:"G0008 bit7 (ERS)=1 means external reset was received. This is normally used as the M02 confirmation signal — check if the program reached M02." },
+      { title:"Reset & rewind signal input",
+        detail:"G0008 bit6 (RRW)=1 means reset & rewind was received. Normally the M30 confirmation signal." },
+      { title:"Reset button on MDI pressed",
+        detail:"The operator may have pressed RESET. If unintentional, check for key bounce or stuck key." },
+      { title:"Servo alarm generated",
+        detail:"Any servo alarm forces cycle stop. Check the alarm screen for the specific servo alarm." },
+      { title:"Mode switch changed or feed hold",
+        detail:"Switching from auto to manual mode causes feed hold. Check G0043 mode select bits. Feed hold: G0008 bit5 (*SP)=0 means feed hold is active. Single block: G0046 bit1 (SBK)=1 means single block stop." },
+    ] },
+
+  // ── SPINDLE BEHAVIOR ─────────────────────────────────────────
+  { key:"ts_spindle_no_turn", category:"Spindle Behavior",
+    title:"Spindle motor does not turn",
+    summary:"M03/M04 commanded but motor stationary — read SPM STATUS first, then check signals or alarm",
+    context:"The SP STATUS display tells you immediately where the problem is. Three possible states: '--' (not ready), '00' (no speed command), or an alarm number. B-65285EN §4.3.2.3.",
+    steps:[
+      { title:"Read SPM STATUS display",
+        detail:"Look at the SP 7-segment LEDs. '--' = not ready, '00' = ready but no command, alarm number = fault. Each leads to a different path." },
+      { title:"STATUS shows '--' — check spindle control signals",
+        detail:"The SP is waiting for ready/command signals. Check these PMC outputs (FS16i/0i): G070 bits MRDYA, SFRA, SRVA. G071 bit *ESPA. G029 bit *SSTP. G030 bits SOV0-7 (spindle override). If any required signal is missing, trace it through the ladder." },
+      { title:"STATUS shows '00' — no speed command",
+        detail:"The SP is ready but no S-command has been issued or the serial spindle speed data is zero. Check that the CNC is sending a speed command. Verify spindle-related parameters per B-65280EN." },
+      { title:"STATUS shows alarm number — refer to alarm",
+        detail:"The alarm code identifies the specific fault. Look up the displayed code in the alarm section." },
+    ] },
+  { key:"ts_spindle_no_speed", category:"Spindle Behavior",
+    title:"Spindle cannot reach commanded speed",
+    summary:"Actual speed always differs from commanded — parameters or alarm",
+    context:"Two paths: consistent speed error (always wrong) = parameter issue. Speed error with alarm = hardware fault. B-65285EN §4.3.2.4.",
+    steps:[
+      { title:"Speed always differs (no alarm) — check parameters",
+        detail:"Check spindle-related parameters per B-65280EN. Common issues: gear ratio parameters (P4056–P4059) don't match mechanical gearing, speed detector parameters incorrect, or accel/decel time (P4082) too short." },
+      { title:"Alarm number displayed on SP — refer to alarm",
+        detail:"If the SP shows an alarm code, that identifies the specific fault. Speed deviation with alarm 02 is covered under SP Alarm 02." },
+      { title:"Check spindle override",
+        detail:"G030 bits SOV0-7 set the spindle override. If override is not at 100%, the actual speed will differ from command. Verify the override switch on the operator panel matches the PMC data." },
+    ] },
+  { key:"ts_spindle_vibrates", category:"Spindle Behavior",
+    title:"Spindle vibrates / makes noise when not cutting",
+    summary:"Vibration at specific speed = mechanical; constant noise = sensor, parameters, or gain",
+    context:"The key diagnostic: does the vibration go away when the motor turns by inertia (free-wheeling)? If noise is the same during inertia, it's mechanical. If it stops, the drive is causing it. B-65285EN §4.3.2.5.",
+    steps:[
+      { title:"Vibration at a specific speed only — check by inertia run",
+        detail:"Let the spindle coast by inertia and listen. Methods to coast: (A) Set MPOF signal (G073#2) to 1 — motor goes to free-wheel immediately. (B) Set ALSP (P4009 bit2) to 1, then turn CNC power off during rotation — motor coasts (SP will show Alarm 24, that's expected)." },
+      { title:"Noise unchanged during inertia — mechanical vibration",
+        detail:"The drive is not the cause. Investigate: bearing wear, unbalanced spindle, belt resonance, coupling alignment, or mechanical resonance at that RPM." },
+      { title:"Noise stops during inertia — drive-induced",
+        detail:"The amplifier or sensor is causing the vibration. Continue to next steps." },
+      { title:"Check sensor waveform",
+        detail:"See §4.3.4 in B-65285EN. Check and adjust the spindle sensor (αi M, MZ, BZ, or CZ) waveform. Bad air gap, contaminated sensor, or damaged sensor ring produces noisy feedback → drive vibration." },
+      { title:"Check motor parameters match motor part number",
+        detail:"Compare motor spec plate to parameters per Appendix A in B-65280EN. Wrong motor ID parameters = wrong commutation = vibration and noise." },
+      { title:"Adjust velocity loop gain",
+        detail:"If sensor waveform and parameters are correct, the velocity loop gain may be too high for the mechanical system. Reduce gain per B-65280EN Chapter 1." },
+    ] },
+  { key:"ts_spindle_overshoot", category:"Spindle Behavior",
+    title:"Overshoot or hunting on spindle",
+    summary:"Speed overshoots target or oscillates — velocity loop, accel/decel, or position gain parameters",
+    context:"Overshoot = speed exceeds target then settles. Hunting = speed oscillates continuously. Both are gain/tuning issues. B-65285EN §4.3.2.6.",
+    steps:[
+      { title:"Adjust velocity loop parameters",
+        detail:"Refer to B-65280EN Chapter 1. Reduce velocity loop proportional gain if oscillating. Increase if response is sluggish with overshoot on deceleration." },
+      { title:"Check accel/decel time constant (P4082)",
+        detail:"Too-short accel/decel time causes overshoot at target speed. Increase P4082 to give the spindle more time to settle." },
+      { title:"Position loop gain (if in position mode)",
+        detail:"During orientation, rigid tapping, or Cs contour control, position gain (P4060–P4072) affects overshoot. Reduce if oscillating during position control modes." },
+      { title:"Check sensor signal quality",
+        detail:"Noisy or degraded sensor feedback causes the velocity loop to hunt. Check sensor waveform per §4.3.4 in B-65285EN." },
+    ] },
+  { key:"ts_spindle_weak_cut", category:"Spindle Behavior",
+    title:"Cutting power weakens, accel/decel slows",
+    summary:"Spindle can't deliver torque — load meter reading determines mechanical vs electrical cause",
+    context:"The load meter is the key diagnostic. If it does NOT show max output, the torque isn't reaching the spindle (mechanical). If it DOES show max output, the motor is at its limit but something is capping it. B-65285EN §4.3.2.7.",
+    steps:[
+      { title:"Load meter does NOT show maximum output — mechanical cause",
+        detail:"Torque is being lost between motor and spindle. Check for belt slip, coupling slip, or excessive bearing drag. Inspect belt tension and pulley condition." },
+      { title:"Load meter DOES show maximum output — check torque limit signals",
+        detail:"Check PMC signals TLMHA and TLMLA (FS16i/0i: G070). If a torque limit signal is incorrectly active, the SP clamps output below full capacity." },
+      { title:"αi BZ sensor — check for sensor gear slip",
+        detail:"If using an αi BZ sensor, slippage between the sensor gear and spindle shaft causes the SP to lose position reference during acceleration. The motor can't build torque correctly." },
+      { title:"Check motor parameters match motor part number",
+        detail:"Wrong motor ID parameters cause incorrect current scaling — motor can't deliver rated torque. Check per Appendix A in B-65280EN." },
+      { title:"Check output limit pattern parameters",
+        detail:"P4028 and P4029 set output restriction patterns. If set incorrectly, the SP limits current below what the motor can deliver. Check per B-65280EN Chapter 1." },
+    ] },
+
+  // ── MEASUREMENT & DIAGNOSTICS ───────────────────────────────
+  { key:"ts_motor_current", category:"Measurement & Diagnostics",
+    title:"How to observe servo motor current",
+    summary:"Real-time current measurement via SERVO GUIDE or check board — setup, parameters, and conversion",
+    context:"Two methods: SERVO GUIDE software (preferred for 30i/0i-C/D) or the servo check board with oscilloscope (older systems). B-65285EN §4.2.3.",
+    steps:[
+      { title:"Method 1: SERVO GUIDE — connect and select axis",
+        detail:"Connect SERVO GUIDE to the CNC. In graph window channel setting, select the axis to measure. Under Kind, select IR and IS (motor current phases). Under Coef, set the maximum allowable current (Ap) for the amplifier model." },
+      { title:"SERVO GUIDE — display waveform",
+        detail:"Select XTYT mode from the graph window mode menu to display current waveforms. Sampling period: 90B0 series supports down to 125μs; 9096 series supports 1ms only." },
+      { title:"Method 2: Check board — parameter setup (90B0 series)",
+        detail:"Set output data numbers: L-axis IR=370, IS=402 on channels 5/6. M-axis IR=2418, IS=2450. Parameters: P2115 (output channel), P2151-2153 (data numbers). Set AXIS digit on check board LED to axis number from P1023." },
+      { title:"Check board — read oscilloscope voltage",
+        detail:"Connect oscilloscope to the check board output channel. Conversion table: αiSV 20 = 5 A/V, αiSV 40 = 10 A/V, αiSV 80 = 20 A/V, αiSV 160 = 40 A/V, αiSV 360 = 90 A/V. Example: 1V reading on αiSV 20 = 5A actual motor current." },
+    ] },
+  { key:"ts_spindle_waveform", category:"Measurement & Diagnostics",
+    title:"How to check spindle sensor feedback waveform",
+    summary:"Measure αi M / MZ / BZ / CZ sensor waveforms — check terminals, specifications, adjustment",
+    context:"Sensor waveform quality directly affects spindle stability, vibration, and alarm susceptibility. Measured via the spindle check board terminals. B-65285EN §4.3.4.",
+    steps:[
+      { title:"Connect check board and identify terminals",
+        detail:"Check terminals are on the spindle check board. PA1/PB1 = motor sensor A/B phases (JYA2 pin5-8). PA2/PB2 = separate sensor A/B phases (JYA4 pin5-8). PS1 = motor Z signal (JYA2 pin1-2). PS2 = separate Z signal (JYA4 pin1-2). EXTSC1 = external one-rotation proximity switch (JYA3 pin15)." },
+      { title:"αi M / MZ / BZ sensor — measure at ≤1500 rpm CW",
+        detail:"Connect oscilloscope to PA1 and PB1 (or PA2/PB2 for separate sensor). Specifications: Vpp = 0.5–1.2 Vp-p, Voffs = 2.5V ±100mV, Vphase = 90° ±3°, Vrip < 70mV. For MZ/BZ: Vpz (Z signal) > 0.5V, Voffz = 2.5V ±100mV." },
+      { title:"αi CZ sensor (analog) — measure at 500 rpm CW",
+        detail:"Specifications: Vpp = 0.9–1.1 Vp-p, Voffs = 2.5V ±50mV. Z signal: Vpz = 0.66–1.65 Vp-p, Voffz = 2.5V ±50mV. Do NOT adjust CZ sensors — they are set at shipment and adjusting them degrades detection precision." },
+      { title:"Evaluate results",
+        detail:"Out-of-spec Vpp = air gap wrong or sensor contaminated. Out-of-spec Voffs = DC offset drift, sensor aging. Vphase error = sensor mounting angle. Excessive Vrip = sensor ring damage, surface contamination, or bearing play. αi M and MZ sensors normally need no adjustment — level check only." },
+    ] },
+  { key:"ts_megger_motor", category:"Measurement & Diagnostics",
+    title:"Megger test on motor and power cable",
+    summary:"Insulation resistance procedure — disconnect points, voltage, thresholds, isolation",
+    context:"Megger testing finds winding-to-frame and cable-to-earth insulation breakdown. Common causes: coolant ingress into motor, cable insulation damaged at flex points, age-related dielectric loss.",
+    steps:[
+      { title:"Power off and confirm DC link is safe",
+        detail:"Turn off main cabinet power. Wait for DC link to discharge (see scenario: 'Confirming DC link is safe before touching') before disconnecting anything." },
+      { title:"Disconnect motor power cable at the amplifier end",
+        detail:"Disconnect the cable carrying the motor power phases (U, V, W). The amplifier connector is typically at the top of the SVM. Label which axis if cables are not already marked." },
+      { title:"Set Megger to 500V DC",
+        detail:"500V is the standard test voltage for FANUC servo motors. Do not use higher voltage — can damage insulation in healthy motors." },
+      { title:"Megger cable + motor together — each phase to earth",
+        detail:"Touch one Megger lead to a phase wire (U, V, or W) at the cable end you disconnected. Touch the other lead to a clean earth point on the machine frame. Repeat for all three phases. Acceptable: above 1 MΩ. Healthy: above 10 MΩ." },
+      { title:"If any phase reads below 1 MΩ — isolate cable vs motor",
+        detail:"Disconnect the power cable at the motor terminal box. Now Megger each piece independently: (A) Cable only — each phase to cable armour/screen. (B) Motor only — each winding terminal to motor frame. Whichever reads below 1 MΩ is the failed component." },
+      { title:"Replace failed component",
+        detail:"Cable failure typically shows damage at a flex point inside conduit — sometimes visible, sometimes not. Motor failure with coolant ingress shows discolouration inside the terminal box. Order replacement before reconnecting." },
+    ],
+    relatedAlarms:["sv410"] },
+  { key:"ts_dc_link_discharge", category:"Measurement & Diagnostics",
+    title:"Confirming DC link is safe before touching",
+    summary:"Wait time, where to measure, expected voltage drop curve, safe threshold",
+    context:"DC link capacitors retain lethal voltage after power-off. Never trust the wait time alone — always measure before touching any internal amplifier terminals.",
+    steps:[
+      { title:"Turn off main cabinet power and lock out",
+        detail:"Switch off the main breaker feeding the cabinet. If the machine has a lockout/tagout procedure, apply it. Make sure no automatic restart sequence is active." },
+      { title:"Wait minimum 5 minutes for capacitor self-discharge",
+        detail:"The bleed resistors inside the PSM discharge the DC link over a few minutes. 5 minutes is the minimum — most healthy units are safe in 2–3 minutes, but always wait the full time." },
+      { title:"Locate DC link terminals on the PSM",
+        detail:"The DC link is exposed at terminals labelled DCP (positive) and DCN (negative) on the PSM, and the same terminals are also on each SVM (the link is shared via busbar). The terminals are usually under a cover.",
+        warn:"Do not touch any terminal until you have confirmed it is discharged." },
+      { title:"Measure between DCP and DCN with a multimeter",
+        detail:"Set multimeter to DC voltage, range above expected link voltage (1000V for HV, 500V for standard). Measure between DCP and DCN. Safe threshold: below 30 VDC. Above 60 VDC = still hazardous, wait longer." },
+      { title:"Also confirm DCP to earth and DCN to earth are near 0V",
+        detail:"In case one of the link rails is shorted to earth due to a fault, check that both DCP and DCN are near 0V relative to machine earth. Any significant reading here indicates a fault — investigate before proceeding." },
+      { title:"If voltage remains high after 10 minutes — bleed resistor failure",
+        detail:"If the link does not discharge below 30V within 10 minutes, the internal bleed resistor in the PSM has likely failed. Use an external bleeder resistor (typically 10kΩ / 50W) across the terminals — apply briefly via insulated probes. Then arrange PSM replacement." },
+    ],
+    relatedAlarms:["psfan","sv410"] },
+
+  // ── COMMUNICATION & I/O ─────────────────────────────────────
+  { key:"ts_io_fail", category:"Communication & I/O",
+    title:"Input from / output to I/O devices cannot be performed",
+    summary:"PMC reads/writes don't reach physical devices — power, cable, allocation, or link fault",
+    context:"If PMC alarm 'NO I/O DEVICE' appears, no I/O devices are recognized at all. Otherwise, check power sequencing, cabling, and allocation. B-64115EN §8.8.",
+    steps:[
+      { title:"Check PMC alarm screen for 'NO I/O DEVICE'",
+        detail:"If this alarm is displayed, no I/O devices are recognized by the CNC. Check all downstream connections." },
+      { title:"Check IOCHK screen on PMC",
+        detail:"PMC → [PMCDGN] → [IOCHK] → [IOLNK]. This screen shows which I/O devices the CNC recognizes by group number and unit ID. Compare against what's physically connected." },
+      { title:"Check I/O device power supply and timing",
+        detail:"All I/O devices must power on BEFORE the CNC or within 500ms after. If the I/O device powers on late, the I/O link won't establish. When CNC is turned off, I/O devices must also be turned off — otherwise the link may fail on the next power-on." },
+      { title:"Check I/O link cables (JD1A/JD1B)",
+        detail:"JD1A = upper (toward CNC), JD1B = lower (toward next device). Check cables are connected to the correct connectors and are not damaged." },
+      { title:"Check I/O signal connections",
+        detail:"Verify input/output signal wiring at each I/O module. For connector panel and operator panel modules: check that 0V or +24V is connected to the common pin, and +24V is connected to the DO common pin." },
+      { title:"Check I/O link allocation",
+        detail:"PMC → [EDIT] → [MODULE] to view/edit allocation. After editing, write changes to FROM on the [I/O] screen — otherwise changes are lost at power-off." },
+    ] },
+  { key:"ts_io_unexpected_addr", category:"Communication & I/O",
+    title:"Connector panel I/O — data input to unexpected address",
+    summary:"Physical input appears at wrong PMC X address — allocation, cable swap, or rotary switch error",
+    context:"Example: data that should be at X004 appears at X010. Three causes cover virtually all cases. B-64115EN §8.9.",
+    steps:[
+      { title:"Check I/O link allocation",
+        detail:"Verify allocation is correct on the PMC screen. See §7.4 in B-64115EN for the check procedure." },
+      { title:"Check unit-to-unit cables (CA52/CA53)",
+        detail:"If CA52 and CA53 connectors are swapped between expansion units, the address assignment reverses. The correct connection chains: Basic CA52→CA53 Exp1 CA52→CA53 Exp2. If CA52→CA52 is connected, expansion units 1 and 3 swap addresses." },
+      { title:"Check expansion unit rotary switch",
+        detail:"If the rotary switch on an expansion unit is set to 1, one unit number is skipped (addresses jump by one extra module). If set to 2, two are skipped. Normal setting is 0 for contiguous addressing." },
+    ] },
+  { key:"ts_io_no_expansion", category:"Communication & I/O",
+    title:"Connector panel I/O — no data output to expansion unit",
+    summary:"Master sends but expansion module doesn't receive — 24V power supply to expansion unit",
+    context:"The most common cause is missing power to the expansion unit. B-64115EN §8.10.",
+    steps:[
+      { title:"Check 24V power at expansion unit pins 18P and 50P",
+        detail:"If DI and DO signals are both missing, 24V is not supplied to the main power input (18P/50P) of the expansion unit." },
+      { title:"Check 24V at pins 1P and 3P",
+        detail:"If DI signals work but DO signals don't, 24V is not supplied to the DO power pins (1P/3P) of the expansion unit." },
+    ] },
+  { key:"ts_noise_action", category:"Communication & I/O",
+    title:"Action against electrical noise",
+    summary:"Grounding, cable separation, shielding, and suppressors — when intermittent faults appear",
+    context:"Noise enters the CNC via capacitive coupling, electromagnetic induction, and ground loops. Noise faults are intermittent, unrepeatable, and often temperature/time-dependent. B-64115EN §2.16.",
+    steps:[
+      { title:"Separate cables into three groups",
+        detail:"Group A: AC/DC power lines (servo/spindle motor power, solenoids, relays). Group B: DI/DO signal cables between CNC and cabinet/machine. Group C: feedback cables (encoder, position coder, MPG, RS-232/422, battery). Keep groups ≥10cm apart or separated by grounded steel plate shields." },
+      { title:"Add spark killers / diodes to solenoids and relays",
+        detail:"Every DC solenoid and relay in Group A must have a flyback diode installed. AC solenoids and relays need RC spark killers. These suppress voltage spikes that radiate noise." },
+      { title:"Check ground systems",
+        detail:"Three ground systems must be separate and correct: Signal Ground (SG) = 0V reference, Frame Ground (FG) = safety and noise suppression (frames, cases, cable shields), System Ground = connects FG between devices to earth. All grounds must star-connect to a single point — never daisy-chain." },
+      { title:"Connect CNC control unit ground terminal",
+        detail:"The CNC control unit ground terminal must connect directly to the cabinet frame ground point with a short, thick conductor. Poor grounding is the single most common cause of intermittent noise problems." },
+      { title:"Process cable shields correctly",
+        detail:"All Group C cable shields must connect to frame ground at BOTH ends via cable clamps (360° contact). Do not pigtail — the pigtail becomes an antenna. Clamp the shield directly to the connector shell or a grounded panel." },
+    ] },
+
+  // ── REFERENCE POSITION ──────────────────────────────────────
+  { key:"ts_ref_fail", category:"Reference Position",
+    title:"Reference return aborts / behaves strangely (alarm 90)",
+    summary:"Manual reference return fails — deceleration dog, speed, one-rotation signal, or pulsecoder fault",
+    context:"Alarm 90 fires when the CNC doesn't receive a one-rotation signal while the axis travels toward the reference point at sufficient speed (≥128 pulses of position error in DGN 300). B-64115EN §8.12.",
+    steps:[
+      { title:"Check position error is ≥128 pulses during return",
+        detail:"DGN 300 must show ≥128 pulses while the axis is moving toward the reference point. If less, the axis is too slow for the one-rotation signal to be reliable." },
+      { title:"Increase speed if position error is too low",
+        detail:"Position error = F×5000 / (3×G×detection unit). Check: P1420 (rapid traverse rate), P1424 (manual rapid rate), P1825 (servo loop gain, normally 3000). Increase feedrate or loop gain to get position error ≥128." },
+      { title:"Check rapid traverse override",
+        detail:"DGN 014 bits ROV1/ROV2: 0,0=100% / 0,1=50% / 1,0=25% / 1,1=F0 rate. If override is reducing speed below the 128-pulse threshold, set it to 100%." },
+      { title:"Check deceleration signal (DEC)",
+        detail:"DGN 009 bits 0-7 (DEC1-DEC8). If the return starts from a position where the deceleration signal is already 0, the feedrate drops to FL rate (P1425), which may be too slow." },
+      { title:"Check motor rotated >1 revolution at sufficient speed",
+        detail:"If the return start position is too close to the reference point, the motor may not complete a full revolution at ≥128 pulses. Move the start position farther away, or jog toward RP at speed first." },
+      { title:"Check pulsecoder voltage and hardware",
+        detail:"Remove motor cover, measure pulsecoder PCB voltage between + and − (or +5V and 0V). Must be ≥4.75V. If low → power supply fault. If voltage OK but alarm persists → pulsecoder is faulty, replace pulsecoder or motor.",
+        warn:"After pulsecoder or motor replacement, the reference position changes — re-establish reference position." },
+    ] },
+  { key:"ts_ref_required", category:"Reference Position",
+    title:"Machine requests reference return (alarm 300)",
+    summary:"Absolute position data lost — battery, replaced motor/encoder, parameter wipe, or cable disconnect",
+    context:"Alarm 300 fires when the absolute position data in the serial pulsecoder was lost. This happens after: battery went dead, pulsecoder replaced, feedback cable disconnected, or SRAM cleared. B-64115EN §8.13.",
+    steps:[
+      { title:"With reference return function — perform manual ref return",
+        detail:"Execute manual reference position return ONLY for the alarming axis. If another alarm prevents ref return, set P1815 bit5 to 0 to release the alarm temporarily, then perform manual operation to a known position." },
+      { title:"Press RESET after ref return completes",
+        detail:"The alarm clears when RESET is pressed after a successful reference position return." },
+      { title:"Without reference return function — dogless ref position setting",
+        detail:"Perform the dogless reference position setting procedure to re-establish the reference position in the absolute encoder." },
+      { title:"After pulsecoder replacement — adjust grid shift",
+        detail:"The new pulsecoder's reference position will differ from the original. Adjust the grid shift value (P1850) to correct the position offset." },
+      { title:"Check related parameters",
+        detail:"P1815 bit5 (APCx): 0=incremental pulsecoder, 1=absolute pulsecoder. P1815 bit4 (APZx): 0=reference position NOT established, 1=established. After a successful ref return, APZx should be 1." },
+    ] },
+
+  // ── SYSTEM RECOVERY ─────────────────────────────────────────
+  { key:"ts_failure_investigation", category:"System Recovery",
+    title:"Investigating conditions under which failure occurred",
+    summary:"Systematic info gathering: alarm history, conditions, repeatability, recent changes",
+    context:"Before diagnosing, gather the facts. The right question often reveals the cause without any troubleshooting. Always do this first — even if the answer seems obvious.",
+    steps:[
+      { title:"What is the operator doing when failure occurs?",
+        detail:"Mode (auto / MDI / jog / handle), which program block was running, which axis was moving, spindle speed, feedrate. The same alarm in different modes can have very different causes." },
+      { title:"Is the failure repeatable?",
+        detail:"Happens every time the same operation is performed = systematic fault (likely parameter, program, or wear). Happens randomly = intermittent fault (likely electrical, thermal, or vibration-related). The pattern points at the cause." },
+      { title:"What changed recently?",
+        detail:"New program, parameter change, tooling change, environmental change (cooler/warmer shop, new building neighbour, power supply changes). 80% of new faults follow a recent change — find what changed." },
+      { title:"Check alarm history — SYSTEM → HISTORY",
+        detail:"Read the alarm history. The alarm shown now may not be the original fault — earlier alarms in the history often point at the real cause. Note the sequence and timing." },
+      { title:"Check for correlations — temperature, time of day, machine state",
+        detail:"Does the fault appear after the machine warms up (thermal expansion / drift)? Only on first run of the morning (cold start)? After lunch (line voltage drop)? Correlations like these point straight at root cause." },
+      { title:"Record exact conditions before attempting any repair",
+        detail:"Photograph the alarm screen, full alarm text, machine state, operator panel. Note any recent unusual sounds, smells, or behaviour. Once you start changing things, the original state is gone." },
+    ] },
+  { key:"ts_backup_before_service", category:"System Recovery",
+    title:"FROM / SRAM backup before any major service",
+    summary:"What to back up, where to back up to, how to verify — before opening the cabinet",
+    context:"A complete backup before service protects against accidental loss of parameters, PMC ladder, or macro variables during repair. Never skip this step.",
+    steps:[
+      { title:"Prepare a clean memory card or USB",
+        detail:"Use a memory card or USB stick with at least 256MB free. FANUC 0i prefers FAT16/FAT32 formatted media. Label it clearly with machine ID and date." },
+      { title:"Back up all parameters",
+        detail:"SYSTEM → [PARAM] → [(OPRT)] → [F OUTPUT]. Save to memory card. This captures all NC parameters — most critical to back up before any service work." },
+      { title:"Back up PMC ladder",
+        detail:"SYSTEM → [PMC] → [I/O] → select output to memory card. The PMC ladder is machine-specific logic — losing it requires the MTB's source ladder file." },
+      { title:"Back up macro variables (if used)",
+        detail:"OFFSET/SETTING → [MACRO] → [(OPRT)] → output to memory card. Required only if the machine uses custom macros — but always safer to back up." },
+      { title:"Back up pitch error compensation table",
+        detail:"SYSTEM → [PARAM] → search 3620 area or use [PITCH] soft key → output. Critical for machines with mapped ballscrew compensation — restoring without this affects positioning accuracy." },
+      { title:"Verify the backup files are readable",
+        detail:"Remove the memory card. Insert into another device (PC or another machine) and confirm files are present and readable. A backup you cannot read is not a backup." },
+    ] },
+];
+
+const TS_CATEGORIES = [
+  "Power & Startup",
+  "No Motion / Operation",
+  "Spindle Behavior",
+  "Measurement & Diagnostics",
+  "Communication & I/O",
+  "Reference Position",
+  "System Recovery",
+];
+
+// ── micro components ─────────────────────────────────────────────
+const Led = ({ val, blink, color = "#FF3300" }) => (
+  <span style={{
+    display:"inline-flex", alignItems:"center", justifyContent:"center",
+    minWidth:44, height:30, borderRadius:5, padding:"0 8px",
+    background:"#0a0a0a", border:`1.5px solid #2a2a2a`,
+    fontFamily:"monospace", fontSize:15, fontWeight:700, color,
+    boxShadow:`0 0 8px ${color}55`,
+    animation: blink ? "blink 1s step-start infinite" : "none",
+  }}>{val}</span>
+);
+
+const Pill = ({ label, color, bg }) => (
+  <span style={{
+    display:"inline-block", fontSize:11, fontWeight:600, padding:"2px 9px",
+    borderRadius:20, background: bg, color, letterSpacing:0.3,
+  }}>{label}</span>
+);
+
+const Badge = ({ label }) => (
+  <span style={{
+    display:"inline-block", fontSize:11, fontWeight:500, padding:"2px 9px",
+    borderRadius:4, background: C.fanucDim, color: C.fanuc, marginRight:5, marginTop:4,
+  }}>{label}</span>
+);
+
+const StubBadge = () => (
+  <span style={{
+    display:"inline-block", fontSize:10, fontWeight:700, padding:"2px 7px",
+    borderRadius:4, background: "#2a2a2a", color: C.textSub,
+    letterSpacing:0.6, textTransform:"uppercase",
+  }}>Stub</span>
+);
+
+const InfoTag = ({ text }) => (
+  <div style={{display:"flex",alignItems:"flex-start",gap:7,marginTop:6,fontSize:11,color:C.blue,lineHeight:1.5}}>
+    <span style={{
+      display:"inline-flex",alignItems:"center",justifyContent:"center",flexShrink:0,
+      width:16,height:16,borderRadius:"50%",background:C.blue,
+      color:"#fff",fontSize:10,fontWeight:800,fontStyle:"italic",fontFamily:"Georgia,serif",
+      marginTop:1,
+    }}>i</span>
+    <span>{text}</span>
+  </div>
+);
+
+const Kbd = ({ children }) => (
+  <span style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:4,
+    padding:"1px 6px", fontFamily:"monospace", fontSize:12, color:C.fanuc}}>{children}</span>
+);
+
+// ── REALISTIC 7-SEGMENT FACEPLATE ────────────────────────────────
+// Renders the amp STATUS display the way it actually looks on the unit:
+// real red segments, ALM (red) + ERR (orange) indicator LEDs, and the
+// unit name underneath. SVM = 1 digit; PS and SP = 2 digits.
+// The ALM LED is only ever red or off (never green). When the display
+// reads "-" the drive isn't in an amp alarm, so ALM and ERR are both off.
+
+// Which segments (a-g) are lit for each character a display can show.
+const SEG_MAP = {
+  "0":"abcdef","1":"bc","2":"abdeg","3":"abcdg","4":"bcfg","5":"acdfg",
+  "6":"acdefg","7":"abc","8":"abcdefg","9":"abcdfg",
+  "A":"abcefg","C":"adef","b":"cdefg","c":"deg","d":"bcdeg","E":"adefg","F":"aefg",
+  "H":"bcefg","L":"def","P":"abefg","U":"bcdef","-":"g"," ":"","":"",
+};
+// Beveled polygon geometry for each segment, viewBox 0 0 52 82.
+const SEG_POLY = {
+  a:"11,4 35,4 39,8 35,12 11,12 7,8",
+  b:"40,12 44,16 44,37 40,41 36,37 36,16",
+  c:"40,42 44,46 44,67 40,71 36,67 36,46",
+  d:"11,70 35,70 39,74 35,78 11,78 7,74",
+  e:"6,42 10,46 10,67 6,71 2,67 2,46",
+  f:"6,12 10,16 10,37 6,41 2,37 2,16",
+  g:"11,37 35,37 39,41 35,45 11,45 7,41",
+};
+// glow: SVG drop-shadow filters are the most expensive thing a list can
+// paint. Big card faceplates keep the glow; small list-row displays render
+// plain fills — visually identical at that size, enormously cheaper.
+const SevenSegChar = memo(({ char, dp, w, lit, glow = true, blink = false }) => {
+  const on = SEG_MAP[char] != null ? SEG_MAP[char]
+           : SEG_MAP[String(char).toUpperCase()] != null ? SEG_MAP[String(char).toUpperCase()]
+           : "";
+  const dim = "#2a0707";
+  const anim = blink ? "blink 1s step-start infinite" : undefined;
+  return (
+    <svg width={w} height={w*82/52} viewBox="0 0 52 82" style={{display:"block"}}>
+      {Object.entries(SEG_POLY).map(([seg,pts]) => {
+        const isOn = on.includes(seg);
+        // Only the lit (red) segments blink; the dark ghost segments never move.
+        const st = {};
+        if (isOn && glow) st.filter = `drop-shadow(0 0 2px ${lit})`;
+        if (isOn && anim) st.animation = anim;
+        return <polygon key={seg} points={pts} fill={isOn?lit:dim} style={st} />;
+      })}
+      <circle cx="48" cy="76" r="3.6" fill={dp?lit:dim}
+        style={{
+          ...(dp&&glow?{filter:`drop-shadow(0 0 2px ${lit})`}:{}),
+          ...(dp&&anim?{animation:anim}:{}),
+        }} />
+    </svg>
+  );
+});
+
+// unit: "PSM" | "SVM" | "SPM"   code: "2" | "8." | "01" | "-" etc.
+const SevenSegDisplay = memo(({ unit, code, scale = 1, showLabel = true, kind = "alarm", alm, err, blink = false }) => {
+  const S = scale;
+  const glow = S >= 0.65;   // full-size card faceplates glow; list chips don't
+  const digitCount = unit === "SVM" ? 1 : 2;
+  const litColor   = "#ff2e2e";                       // real αi displays are red
+  const unitLabel  = unit === "PSM" ? "PS" : unit === "SPM" ? "SP" : "SVM";
+
+  const raw   = (code == null ? "" : String(code));
+  const bare  = raw.replace(/[.\s]/g, "");
+  const dash  = bare.length > 0 && /^[-−]+$/.test(bare);
+  const hasDp = raw.includes(".");
+  let main = dash ? (digitCount === 2 ? "--" : "-") : bare;
+  if (main.length < digitCount) main = " ".repeat(digitCount - main.length) + main; // right-justify
+  if (main.length > digitCount) main = main.slice(-digitCount);
+  const chars   = main.split("");
+  const dpIndex = hasDp ? digitCount - 1 : -1;
+
+  // ALM and ERR are mutually exclusive — never lit together.
+  //  • status error   -> ERR (orange) lit, ALM off
+  //  • "-" (no amp code, drive not in amp-alarm) -> BOTH off
+  //  • any real alarm  -> ALM (red) lit, ERR off
+  // The ALM LED is only ever red or off — it is never green.
+  const isError  = kind === "error";
+  const almColor = C.red;
+  const almLit   = alm !== undefined ? alm : (!isError && !dash);
+  const errLit   = err !== undefined ? err : isError;
+
+  const digitW   = 22 * S;
+  const ledSize  = 9 * S;
+  const labelPx  = Math.max(6, 7 * S);
+
+  const LED = ({ label, color, lit }) => (
+    <div style={{display:"flex",alignItems:"center",gap:3*S,justifyContent:"flex-end"}}>
+      <span style={{fontSize:labelPx,fontWeight:800,letterSpacing:0.3,
+        color:lit?color:"#4a4a4a"}}>{label}</span>
+      <span style={{width:ledSize,height:ledSize,borderRadius:"50%",flexShrink:0,
+        background:lit?color:"#241f1f",
+        boxShadow:lit?`0 0 ${5*S}px ${color}`:"none",
+        border:`1px solid ${lit?color:"#333"}`}} />
+    </div>
+  );
+
+  return (
+    <div style={{display:"inline-flex",flexDirection:"column",alignItems:"center",gap:4*S}}>
+      <div style={{display:"flex",alignItems:"center",gap:7*S,
+        background:"linear-gradient(145deg,#2b2d31,#141517)",
+        border:"1px solid #090909",borderRadius:6*S,padding:`${7*S}px ${8*S}px`,
+        boxShadow:"inset 0 1px 1px rgba(255,255,255,0.05), 0 1px 3px rgba(0,0,0,0.6)"}}>
+        <div style={{display:"flex",flexDirection:"column",gap:5*S}}>
+          <LED label="ALM" color={almColor} lit={almLit} />
+          <LED label="ERR" color={C.orange}  lit={errLit} />
+        </div>
+        <div style={{display:"flex",gap:2*S,alignItems:"center",
+          background:"#0a0505",borderRadius:3*S,padding:`${5*S}px ${6*S}px`,
+          boxShadow:"inset 0 1px 4px rgba(0,0,0,0.9)"}}>
+          {chars.map((ch,i)=>(
+            <SevenSegChar key={i} char={ch} dp={i===dpIndex} w={digitW} lit={litColor} glow={glow} blink={blink} />
+          ))}
+        </div>
+      </div>
+      {showLabel && (
+        <div style={{fontSize:Math.max(8,10*S),fontWeight:800,color:C.textSub,letterSpacing:1.5}}>
+          {unitLabel}
+        </div>
+      )}
+    </div>
+  );
+});
+
+// ── CHECKLIST SYSTEM ─────────────────────────────────────────────
+// Shared across ALL alarm cards — same hook, same components, same UX.
+
+function useChecklist(count) {
+  const [checked, setChecked] = useState(() => new Array(count).fill(false));
+  const toggle = (i) => setChecked(c => c.map((v, j) => j === i ? !v : v));
+  const reset  = ()  => setChecked(new Array(count).fill(false));
+  const done   = checked.filter(Boolean).length;
+  return { checked, toggle, reset, done, total: count };
+}
+
+const ChecklistProgress = ({ done, total, onReset }) => {
+  const pct     = total > 0 ? (done / total) * 100 : 0;
+  const allDone = done === total;
+  return (
+    <div style={{marginBottom:10}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:5}}>
+        <span style={{
+          fontSize:11, fontWeight:700, letterSpacing:0.3,
+          color: allDone ? C.green : C.textSub,
+        }}>
+          {allDone ? "✓ All steps complete" : `${done} / ${total} steps done`}
+        </span>
+        {done > 0 && (
+          <button
+            onClick={e => { e.stopPropagation(); onReset(); }}
+            style={{fontSize:11,color:C.textDim,background:"none",border:"none",
+              cursor:"pointer",padding:"2px 8px",borderRadius:4,fontFamily:"inherit"}}>
+            Reset
+          </button>
+        )}
+      </div>
+      <div style={{height:3,borderRadius:2,background:C.border,overflow:"hidden"}}>
+        <div style={{
+          height:"100%", borderRadius:2,
+          background: allDone ? C.green : C.fanuc,
+          width:`${pct}%`,
+          transition:"width 0.25s ease, background 0.3s ease",
+        }} />
+      </div>
+    </div>
+  );
+};
+
+// Each tappable step row — collapses detail when checked to save space.
+const CheckStep = ({ index, title, detail, warn, note, checked, onToggle }) => (
+  <div
+    onClick={onToggle}
+    style={{
+      display:"flex", gap:12,
+      background: checked ? C.greenDim : C.card,
+      border:`1px solid ${checked ? C.green+"55" : C.border}`,
+      borderRadius:10, padding:"11px 12px",
+      cursor:"pointer",
+      transition:"background 0.15s, border-color 0.15s",
+    }}
+  >
+    {/* Checkbox */}
+    <div style={{
+      width:22, height:22, borderRadius:5, flexShrink:0, marginTop:1,
+      border:`2px solid ${checked ? C.green : C.border}`,
+      background: checked ? C.green : "transparent",
+      display:"flex", alignItems:"center", justifyContent:"center",
+      transition:"all 0.15s",
+    }}>
+      {checked && <span style={{fontSize:12,color:C.bg,fontWeight:800,lineHeight:1}}>✓</span>}
+    </div>
+
+    {/* Content */}
+    <div style={{flex:1,minWidth:0}}>
+      <div style={{display:"flex",alignItems:"baseline",gap:7,marginBottom: checked ? 0 : 3}}>
+        <span style={{
+          fontSize:11, fontWeight:700, fontFamily:"monospace", letterSpacing:0.5,
+          color: checked ? C.green+"77" : C.textDim, flexShrink:0,
+        }}>
+          {String(index + 1).padStart(2, "0")}
+        </span>
+        <span style={{
+          fontSize:15, fontWeight:600,
+          color: checked ? C.green : C.text,
+          textDecoration: checked ? "line-through" : "none",
+          opacity: checked ? 0.65 : 1,
+        }}>
+          {title}
+        </span>
+      </div>
+
+      {!checked && detail && (
+        <div style={{fontSize:14,color:C.textSub,lineHeight:1.7}}>{detail}</div>
+      )}
+      {!checked && warn && (
+        <div style={{background:C.redDim,border:`1px solid ${C.red}44`,borderRadius:6,
+          padding:"6px 10px",marginTop:6,fontSize:12,color:C.red,lineHeight:1.5}}>
+          ⚠ {warn}
+        </div>
+      )}
+      {!checked && note && (
+        <div style={{background:C.blueDim,border:`1px solid ${C.blue}33`,borderRadius:6,
+          padding:"6px 10px",marginTop:6,fontSize:11,color:C.blue,lineHeight:1.5}}>
+          💡 {note}
+        </div>
+      )}
+    </div>
+  </div>
+);
+
+// Drop-in checklist block used by every alarm card.
+function AlarmChecklist({ steps, total = 0 }) {
+  const cl = useChecklist(steps.length);
+  return (
+    <div>
+      {total >= 5 && (
+        <div style={{fontSize:11, color:C.fanuc, marginBottom:6, fontWeight:600}}>
+          ↕ Reordered by {total} field reports
+        </div>
+      )}
+      <ChecklistProgress done={cl.done} total={cl.total} onReset={cl.reset} />
+      <div style={{display:"flex",flexDirection:"column",gap:6}}>
+        {steps.map((s, i) => (
+          <CheckStep
+            key={s.title}
+            index={i}
+            {...s}
+            checked={cl.checked[i]}
+            onToggle={() => cl.toggle(i)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── SURVEY SYSTEM ────────────────────────────────────────────────
+// Shared storage pools responses across all technicians using the app.
+// After 5 total responses the checklist auto-reorders: most reported cause first.
+
+function useAlarmSurvey(key, steps) {
+  const [counts, setCounts]     = useState({});
+  const [submitted, setSubmitted] = useState(false);
+  const [ready, setReady]       = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get(`survey:${key}`, true);
+        if (r?.value) setCounts(JSON.parse(r.value));
+      } catch {}
+      setReady(true);
+    })();
+  }, [key]);
+
+  const submit = async (title) => {
+    const next = { ...counts, [title]: (counts[title] || 0) + 1 };
+    setCounts(next);
+    setSubmitted(true);
+    try { await window.storage.set(`survey:${key}`, JSON.stringify(next), true); } catch {}
+  };
+
+  const total = Object.values(counts).reduce((s, n) => s + n, 0);
+
+  // Reorder steps once 5+ responses collected — highest count first
+  const orderedSteps = ready && total >= 5
+    ? [...steps].sort((a, b) => (counts[b.title] || 0) - (counts[a.title] || 0))
+    : steps;
+
+  return { counts, submit, submitted, ready, total, orderedSteps };
+}
+
+function AlarmSurvey({ steps, counts, onSubmit, submitted, total }) {
+  if (submitted) {
+    return (
+      <div style={{background:C.greenDim, border:`1px solid ${C.green}44`, borderRadius:10,
+        padding:"10px 14px", marginTop:12, fontSize:12, color:C.green}}>
+        ✓ Response recorded — {total} total field report{total !== 1 ? "s" : ""} for this alarm.
+      </div>
+    );
+  }
+
+  return (
+    <div style={{background:C.card, border:`1px solid ${C.fanuc}33`, borderRadius:10,
+      padding:"12px 14px", marginTop:12}}>
+      <div style={{fontSize:11, fontWeight:700, textTransform:"uppercase", letterSpacing:0.8,
+        color:C.fanuc, marginBottom:10}}>
+        What caused this alarm?
+      </div>
+      <div style={{display:"flex", flexDirection:"column", gap:5}}>
+        {steps.map((s, i) => (
+          <button key={i} onClick={() => onSubmit(s.title)}
+            style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:8,
+              padding:"9px 12px", fontSize:12, color:C.text, cursor:"pointer",
+              textAlign:"left", fontFamily:"inherit",
+              display:"flex", alignItems:"center", gap:8}}>
+            <span style={{color:C.fanuc, fontSize:11, flexShrink:0}}>›</span>
+            <span style={{flex:1}}>{s.title}</span>
+            {(counts[s.title] || 0) > 0 && (
+              <span style={{background:C.fanucDim, color:C.fanuc, fontSize:10,
+                fontWeight:700, padding:"1px 7px", borderRadius:10, flexShrink:0}}>
+                {counts[s.title]}×
+              </span>
+            )}
+          </button>
+        ))}
+        <button onClick={() => onSubmit("Other / not listed")}
+          style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:8,
+            padding:"9px 12px", fontSize:12, color:C.textSub, cursor:"pointer",
+            textAlign:"left", fontFamily:"inherit",
+            display:"flex", alignItems:"center", gap:8}}>
+          <span style={{color:C.textDim, fontSize:11, flexShrink:0}}>›</span>
+          Other / not listed
+        </button>
+      </div>
+      <div style={{fontSize:11, color:C.textDim, marginTop:8}}>
+        {total === 0 && "Be the first to report — helps the team find the cause faster."}
+        {total > 0 && total < 5 && `${5 - total} more report${5 - total !== 1 ? "s" : ""} until checklist auto-reorders.`}
+        {total >= 5 && `Checklist order based on ${total} field reports.`}
+      </div>
+    </div>
+  );
+}
+
+// ── STATUS REFERENCE PAGE ────────────────────────────────────────
+function StatusPage() {
+  // PS = yellow, SP = blue, SV = red (the app's unit colour language).
+  // The 7-segment digits themselves stay red — that's how the real αi displays look.
+  const units = [
+    { unit:"PS", amp:"PSM", icon:"PS", sub:"Power Supply", col:C.fanuc, states:[
+      { disp:"--", state:"Standby", desc:"Control power on, PS is not ready." },
+      { disp:"0",  state:"Ready",   desc:"Fully operational." },
+      { disp:"2",  state:"Alarm", alm:true, desc:"Look it up in the PS alarm codes." },
+    ]},
+    { unit:"SP", amp:"SPM", icon:"SP", sub:"Spindle Amplifier", col:C.blue, states:[
+      { disp:"--", blink:true, state:"Standby", desc:"Blinking dashes — spindle not ready yet." },
+      { disp:"--", state:"Ready",   desc:"Steady dashes — ready, motor stopped." },
+      { disp:"00", state:"Running", desc:"Motor rotating normally." },
+      { disp:"2",  state:"Alarm", alm:true, desc:"Look it up in the SP alarm codes." },
+    ]},
+    { unit:"SV", amp:"SVM", icon:"SVM", sub:"Servo Amplifier", col:C.red, states:[
+      { disp:"-", state:"Standby", desc:"Control power on, main power not yet on." },
+      { disp:"0", state:"Ready",   desc:"Fully operational." },
+      { disp:"2", state:"Alarm", alm:true, desc:"Look it up in the SV alarm codes." },
+    ]},
+  ];
+  return (
+    <div>
+      <div style={{marginBottom:20}}>
+        <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:6}}>Quick Reference</div>
+        <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:-0.5}}>Amplifier STATUS Display</div>
+        <div style={{fontSize:14,color:C.textSub,marginTop:4,lineHeight:1.6}}>First step when opening the cabinet — read every STATUS display before touching anything or checking the CNC alarm screen.</div>
+      </div>
+
+      {units.map(u => (
+        <div key={u.unit} style={{marginBottom:16}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+            <div style={{width:30,height:30,borderRadius:8,flexShrink:0,background:`${u.col}1f`,
+              border:`1px solid ${u.col}55`,display:"flex",alignItems:"center",justifyContent:"center"}}>
+              <CatIcon type={u.icon} col={u.col} size={18} />
+            </div>
+            <span style={{fontSize:16,fontWeight:800,color:u.col,letterSpacing:0.5}}>{u.unit}</span>
+            <span style={{fontSize:13,color:C.textSub}}>{u.sub}</span>
+          </div>
+          <div style={{background:C.card,borderRadius:14,overflow:"hidden",border:`1px solid ${u.col}33`}}>
+            {u.states.map((s,i) => (
+              <div key={i} style={{display:"flex",alignItems:"center",gap:14,padding:"12px 14px",
+                borderBottom:i<u.states.length-1?`1px solid ${C.border}`:"none"}}>
+                <div style={{flexShrink:0}}>
+                  <SevenSegDisplay unit={u.amp} code={s.disp} scale={0.7} showLabel={false} alm={!!s.alm} err={false} blink={!!s.blink} />
+                </div>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:15,fontWeight:700,color:C.text,marginBottom:2}}>{s.state}</div>
+                  <div style={{fontSize:13,color:C.textSub,lineHeight:1.55}}>{s.desc}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+
+    </div>
+  );
+}
+
+// ── DGN 358 — per-bit interactive checklist ──────────────────────
+// Self-contained component so each failing bit gets its own state.
+function BitChecklist({ steps, onComplete }) {
+  const [checked, setChecked] = useState(() => steps.map(() => false));
+  const toggle = (i) => {
+    const next = checked.map((v,j) => j===i ? !v : v);
+    setChecked(next);
+    if (onComplete) onComplete(next.every(Boolean));
+  };
+  const reset = () => {
+    setChecked(steps.map(() => false));
+    if (onComplete) onComplete(false);
+  };
+  const done   = checked.filter(Boolean).length;
+  const all    = done === steps.length;
+  const pct    = steps.length > 0 ? (done / steps.length) * 100 : 0;
+  return (
+    <div style={{marginTop:10}}>
+      {/* Mini progress bar */}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+        <span style={{fontSize:11,fontWeight:700,color:all ? C.green : "#ffaaaa"}}>
+          {all ? "✓ Done" : `${done} / ${steps.length} checked`}
+        </span>
+        {done > 0 && (
+          <button onClick={e=>{e.stopPropagation();reset();}}
+            style={{fontSize:11,color:C.textDim,background:"none",border:"none",
+              cursor:"pointer",fontFamily:"inherit"}}>Reset</button>
+        )}
+      </div>
+      <div style={{height:2,borderRadius:1,background:`${C.red}33`,overflow:"hidden",marginBottom:8}}>
+        <div style={{height:"100%",borderRadius:1,
+          background: all ? C.green : C.fanuc,
+          width:`${pct}%`, transition:"width 0.25s ease, background 0.3s ease"}} />
+      </div>
+      {/* Steps */}
+      <div style={{display:"flex",flexDirection:"column",gap:5}}>
+        {steps.map((s,i) => (
+          <div key={i} onClick={() => toggle(i)} style={{
+            display:"flex", gap:10,
+            background: checked[i] ? `${C.green}0f` : `${C.red}0a`,
+            border:`1px solid ${checked[i] ? C.green+"44" : C.red+"33"}`,
+            borderRadius:8, padding:"9px 10px", cursor:"pointer",
+            transition:"background 0.15s, border-color 0.15s",
+          }}>
+            {/* Checkbox */}
+            <div style={{
+              width:18, height:18, borderRadius:4, flexShrink:0, marginTop:1,
+              border:`2px solid ${checked[i] ? C.green : C.red+"77"}`,
+              background: checked[i] ? C.green : "transparent",
+              display:"flex", alignItems:"center", justifyContent:"center",
+              transition:"all 0.15s",
+            }}>
+              {checked[i] && <span style={{fontSize:10,color:C.bg,fontWeight:800,lineHeight:1}}>✓</span>}
+            </div>
+            {/* Content */}
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{
+                fontSize:12, fontWeight:600,
+                color: checked[i] ? C.green+"99" : "#ffcccc",
+                textDecoration: checked[i] ? "line-through" : "none",
+                marginBottom: (!checked[i] && s.detail) ? 3 : 0,
+              }}>{s.title}</div>
+              {!checked[i] && s.detail && (
+                <div style={{fontSize:11,color:"#ffaaaa",lineHeight:1.55}}>{s.detail}</div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── DGN 358 DECODER PAGE ─────────────────────────────────────────
+function Dgn358Page() {
+  const [dec, setDec] = useState("");
+  const [hex, setHex] = useState("");
+  const [val, setVal] = useState(null);
+  const [doneMap, setDoneMap] = useState({});  // tracks per-bit checklist completion
+
+  // Bits become 1 sequentially 5→6→7→8→9→10→11→12→13→14 during normal startup.
+  // First (lowest) bit = 0 is the root cause of the VRDY-OFF alarm.
+  const bits = [
+    {
+      n:5, name:"HRDY", label:"Host (CNC) ready — FSSB link active",
+      context:"The CNC has not established FSSB communication with this amplifier. This is the first step in the startup sequence — nothing proceeds until the optical link is live.",
+      steps:[
+        { title:"Check FSSB fiber optic cable — CNC end",
+          detail:"The fiber optic cable runs from the CNC optical board to the first servo amplifier in the chain. Push the connector fully into the CNC socket and the amplifier socket. Check the fiber for bends, kinks, or oil on the connector face. Clean with dry compressed air." },
+        { title:"Check FSSB connections at each amplifier in the chain",
+          detail:"FSSB is a daisy-chain: CNC → SVM1 → SVM2 → SVM3. If the failing axis is not the first, check the fiber going INTO that amplifier from the previous one. A fault anywhere in the chain before this axis blocks HRDY. Swap the suspect cable with a known working one to confirm." },
+        { title:"Check if an SDU module is in the FSSB chain",
+          detail:"If the machine uses an SDU module, it is also part of the FSSB chain between the CNC and the amplifiers. Check its fiber connections at both ends." },
+        { title:"Replace the NC axis control card — only if all other bits are OK",
+          detail:"Only consider this if HRDY is the only failing bit and all fiber cables, SDU, and amplifiers are confirmed OK. This card is expensive and the lead time is long — contact FANUC support to confirm the diagnosis before ordering." },
+      ],
+    },
+    {
+      n:6, name:"*ESP", label:"Emergency stop released",
+      context:"The E-stop chain is open. The entire drive system is inhibited until every contact in the chain is closed.",
+      steps:[
+        { title:"Check all E-stop buttons — panel and pendant",
+          detail:"Every button must be fully released. Twist-to-release types: pull out AND rotate until latched. Press each button deliberately and release it to confirm the contact resets. Check for a button that appears out but has an internally stuck contact." },
+        { title:"Find the E-stop circuit in the machine electrical book",
+          detail:"Every machine has an E-stop chain diagram in its electrical documentation. Find it and trace every contact in the chain — this will show you exactly which switch, relay, or interlock is in series and where the open contact is likely to be." },
+        { title:"Check safety relay units (Pilz, SICK, etc.)",
+          detail:"Many machines use a dedicated safety relay module or safety PLC in the E-stop chain. These units can trip independently due to their own internal faults or wiring issues. Check the safety unit's status LEDs — most have a fault indicator." },
+        { title:"Monitor *ESP in PMC — address is always X8.4",
+          detail:"SYSTEM → PMC → STATUS → search X8.4. This is the *ESP input signal — it must read 1 when the chain is fully closed. If it reads 0 with all buttons released, trace which physical input is holding the chain open. Also check that the I/O module reading X8.4 is healthy — a faulty I/O module can report 0 even when the physical signal is present." },
+        { title:"Check OT limit switches — use OT release button if available",
+          detail:"OT limit switches are wired in series with the E-stop chain on most machines. If OT0500 or OT0501 is also active, clear the OT alarm first. Some machines have a dedicated OT RELEASE button on the operator panel — hold it while jogging the axis away from the limit, then release." },
+      ],
+    },
+    {
+      n:7, name:"MCONS", label:"MCON sent — CNC commanded the drive system ON",
+      context:"The CNC has not sent the motor-on command to the drive chain. This means the CNC is deliberately holding the drives off — either due to a configuration setting or a PMC interlock condition for this axis.",
+      steps:[
+        { title:"Cold restart the CNC",
+          detail:"The easiest first step. A CNC software state issue can sometimes hold MCON off after an abnormal shutdown. Power off completely, wait 30 seconds, and power on again." },
+        { title:"Check if the axis is configured as active in the CNC",
+          detail:"During maintenance or commissioning, an axis can be set as detached or disabled in the CNC configuration — the CNC will not send the motor-on command to a disabled axis. Check the FSSB axis assignment parameters and confirm this axis is active and assigned." },
+        { title:"Check PMC signals for this axis",
+          detail:"A PMC interlock or mode condition may be blocking the servo enable command for this specific axis. Check the machine's PMC signal list in the electrical book for any axis-specific enable or inhibit signals." },
+      ],
+    },
+    {
+      n:8, name:"MCONA", label:"MCON acknowledged — amplifier received the command",
+      context:"The CNC sent MCON but the servo amplifier did not acknowledge receipt. Primary cause: CXA2A/B inter-module communication cable, or the SVM control PCB is not fully seated.",
+      steps:[
+        { title:"⚠ Before touching CXA2A/B — check if encoder battery is wired through it",
+          detail:"Some MTBs wire the 6V absolute encoder battery through the CXA2A/B connector. If this is the case on this machine, disconnecting it will cause loss of absolute zero position for all axes on that chain. Check the machine's electrical book before disconnecting anything.",
+          warn:"Disconnecting CXA2A/B without confirming battery wiring may cause loss of machine zero position." },
+        { title:"Check CXA2A/B inter-module communication cable",
+          detail:"The CXA2A/B cable connects the PSM to the SVM chain and carries the MCON signal between modules. With power on, check both connectors are firmly seated. If safe to do so (no battery wired through it), check for damage or a loose pin." },
+        { title:"Re-seat the SVM control PCB — with power OFF",
+          detail:"Power off the machine completely. Push the SVM faceplate firmly until it clicks fully home. A partially seated control PCB disrupts internal communication and holds MCONA=0. Power back on and check again." },
+        { title:"Replace the SVM — identify which one first",
+          detail:"The alarm message on the CNC screen shows the axis number (e.g. '1-TH AXIS'). Replace the SVM module driving that specific axis. If the alarm does not show a specific axis, check which SVM has an abnormal 7-segment code or status — that is the one to replace." },
+      ],
+    },
+    {
+      n:9, name:"MCOFF", label:"MCC off confirmed — contactor open before turn-on",
+      context:"A safety check: the system must confirm the MCC (magnetic contactor) was open before commanding it closed. MCOFF=0 means this confirmation was not received — usually an MCC auxiliary contact fault or a welded contactor.",
+      steps:[
+        { title:"Check MCC auxiliary contact — off-state feedback",
+          detail:"The MCC has an auxiliary contact that feeds back its open/closed state to the PSM. If this contact is faulty, bent, or wired incorrectly, the PSM cannot confirm the MCC was open. Check the auxiliary contact wiring at the MCC terminal block." },
+        { title:"Check for welded MCC contacts",
+          detail:"A welded (stuck-closed) MCC main contact means the contactor never fully opens — so MCOFF confirmation is never possible. Look for signs of overheating, burning, or arcing on the MCC. A welded MCC is a safety hazard and must be replaced before operating the machine." },
+        { title:"Check any external MCC sequence",
+          detail:"If there is an external contactor sequence in addition to the PSM's internal MCC, check that sequence. An external contactor that stays closed will prevent MCOFF from being confirmed." },
+      ],
+    },
+    {
+      n:10, name:"CRDY", label:"Converter (PSM) preparation completed",
+      context:"The PSM (Power Supply Module) has not reached ready state. CRDY=0 is the most common root cause of SV0401. If CRDY=0, bits 11–14 will also be 0 as a cascade — fix CRDY first.",
+      steps:[
+        { title:"Check PSM control power supply — is it on?",
+          detail:"The PSM requires control power (single-phase, typically 200VAC) to initialise. Check the control power supply is switched on and delivering voltage to the PSM. No control power = PSM 7-segment will be dark." },
+        { title:"Read PSM 7-segment display",
+          detail:"Any code other than '-' (standby) or '0' (ready) = the PSM has its own alarm. That code is the root cause — look it up in the PSM alarm list and resolve it first." },
+        { title:"Check breaker and 3-phase input voltage",
+          detail:"Verify the main circuit breaker for the PSM is on and not tripped. Measure 3-phase voltage at PSM input terminals — must be within ±10% of nameplate voltage on all three phases. A missing or low phase prevents PSM from reaching ready." },
+        { title:"Check AC reactor if fitted",
+          detail:"An AC reactor on the PSM input that is overloaded, open-circuit, or has loose terminals will prevent the PSM from starting. Check for overheating and test continuity." },
+        { title:"Replace PSM",
+          detail:"Input power confirmed correct, no PSM alarm code, all upstream checks clear, but CRDY still 0 = PSM internal failure. Replace with the same PSM type used on this machine." },
+      ],
+    },
+    {
+      n:11, name:"RLY", label:"DB relay coil energized — relay commanded on",
+      context:"The servo amplifier should command the dynamic brake relay coil to energize at this stage of startup. RLY=0 means the coil was never commanded — the drive enable signal may not be reaching the amplifier.",
+      steps:[
+        { title:"Check the SVM 7-segment display",
+          detail:"Look at the 7-segment LED on the SVM for the alarming axis. Any code other than '0' = the amplifier detected an internal fault that prevented the relay from being commanded. Note the code and look it up." },
+        { title:"Check the servo enable signal in PMC",
+          detail:"The DB relay is only commanded when the drive is being enabled. In the PMC STATUS screen, find the servo enable/servo-off signal for this axis — the address is machine-specific, check the PMC signal list in the machine electrical book. Confirm the enable signal is active." },
+        { title:"Replace the SVM for the alarming axis",
+          detail:"7-segment shows no alarm, enable signal is confirmed active, but RLY still 0 = the DB relay drive circuit inside the SVM has failed. Replace the SVM module for the alarming axis." },
+      ],
+    },
+    {
+      n:12, name:"INTL", label:"DB relay released — motor windings free",
+      context:"The DB relay coil was commanded (RLY=1) but the relay contacts have not confirmed open. Motor windings are still shorted — the motor cannot move. INTL=0 with RLY=1 = relay mechanical fault inside the amplifier.",
+      steps:[
+        { title:"Listen for DB relay click during drive enable",
+          detail:"When the drive enables, the DB relay produces a distinct click inside the amplifier. RLY=1 but no click = the coil is energized but the mechanism is not moving. Relay contacts are stuck." },
+        { title:"Check if motor shaft is completely locked",
+          detail:"With machine off, try rotating the motor coupling by hand. If completely locked beyond normal resistance, the DB relay contacts may be welded, creating a hard short across the motor windings. This is an amplifier replacement case." },
+        { title:"Replace the SVM for the alarming axis",
+          detail:"INTL=0 with RLY=1 is an internal SVM failure — the DB relay contacts are stuck or the interlock feedback circuit is faulty. Replace the SVM module driving the alarming axis." },
+      ],
+    },
+    {
+      n:13, name:"DRDY", label:"Amplifier hardware ready — DC link charged",
+      context:"The amplifier hardware has not completed its ready sequence. Usually the DC link has not charged. Check DC link voltage first — compare against the expected value for your PSM type.",
+      steps:[
+        { title:"Confirm CRDY (bit 10) is OK first",
+          detail:"DRDY requires the DC link to be charged, which requires CRDY. If CRDY=0 also, fix that first — DRDY=0 may simply be a cascade from the PSM not being ready." },
+        { title:"Measure DC link voltage on the SVM",
+          detail:"Measure at the DC link terminals on the SVM. Standard αiPS (200VAC input): 283–339 VDC. HV αiPS (400VAC input): 537–679 VDC. Zero or very low = MCC not closing or PSM not delivering to the DC bus.",
+          warn:"Confirm DC link has fully discharged before touching any amplifier terminals." },
+        { title:"Check MCC closing during power-up",
+          detail:"Listen for the MCC to close during power-up. No click = MCC not operating. Check the MCC coil is being energized and the main contacts are closing. A failed MCC = no DC link charge = DRDY=0." },
+        { title:"Replace the SVM — identify which one first",
+          detail:"The alarm message shows the axis number (e.g. '1-TH AXIS'). Replace the SVM module driving that axis. If the alarm does not identify a specific axis, check which SVM 7-segment shows an abnormal code — that is the one to replace." },
+      ],
+    },
+    {
+      n:14, name:"SRDY", label:"Amplifier software ready — initialisation complete",
+      context:"All hardware is ready (DRDY=1) but the SVM software has not completed initialisation. This is the final startup step.",
+      steps:[
+        { title:"Power cycle completely — cold restart",
+          detail:"Power off CNC and main cabinet for 30 seconds, then power on. SRDY=0 can be a one-time initialisation failure that clears on a cold restart. If it clears and later recurs, continue with the checks below." },
+        { title:"Re-seat the SVM control PCB — with power OFF",
+          detail:"Power the machine completely off. Push the SVM faceplate fully home until it clicks. A partially seated PCB can pass early startup stages but fail during software initialisation." },
+        { title:"Check FSSB fiber cable at this SVM",
+          detail:"A marginal fiber connection can pass the HRDY stage but fail during the software handshake. Check the fiber connectors at both ends of the cable going to this specific SVM. Clean connector faces with dry air." },
+        { title:"Replace the SVM — identify which one first",
+          detail:"The alarm message shows the axis number (e.g. '2-TH AXIS'). Replace the SVM module driving that axis. If the axis is not clear from the alarm, check which SVM 7-segment shows an abnormal code during startup — that is the one to replace." },
+      ],
+    },
+  ];
+
+    const decode = (from, raw) => {
+    let v;
+    if (from==="dec") { v=parseInt(raw); if(!isNaN(v)) setHex(v.toString(16).toUpperCase()); }
+    else              { v=parseInt(raw,16); if(!isNaN(v)) setDec(String(v)); }
+    setVal(!isNaN(v)&&raw!==""?Math.max(0,Math.min(65535,v)):null);
+  };
+
+  // Bits checked in startup order (lowest first) — first 0 bit = root cause
+  const bitsInOrder = [...bits].sort((a,b) => a.n - b.n);
+  const firstFail = val !== null ? bitsInOrder.find(b => ((val >> b.n) & 1) === 0) : null;
+
+  return (
+    <div>
+      <div style={{marginBottom:20}}>
+        <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:6}}>Alarm 401 / SV0401 Tool</div>
+        <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:-0.5}}>DGN No.358 Decoder</div>
+        <div style={{fontSize:13,color:C.textSub,marginTop:4,lineHeight:1.6}}>Use only when alarm 401 / SV0401 is the <em>only</em> alarm shown and all amplifier displays show normal state.</div>
+      </div>
+      <div style={{background:C.redDim,border:`1px solid ${C.red}44`,borderRadius:10,
+        padding:"10px 14px",marginBottom:10,fontSize:13,color:"#ffaaaa",lineHeight:1.6}}>
+        <strong style={{display:"block",marginBottom:3}}>⚠ Check first — before using this decoder</strong>
+        1. Any other alarm active on CNC? → fix that alarm first.<br/>
+        2. All PS / SP / SV displays showing normal state? → if any shows a code, refer to that unit's alarm first.
+      </div>
+      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"12px 14px",marginBottom:14}}>
+        <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:0.8,color:C.textSub,marginBottom:6}}>How to read DGN 358</div>
+        <div style={{fontSize:13,color:C.textSub,lineHeight:1.7}}>
+          Press <Kbd>SYSTEM</Kbd> → <Kbd>DGNOS</Kbd> → type <Kbd>358</Kbd> → press <Kbd>NO.SRH</Kbd>
+          <br/>The screen shows a decimal number. Enter it below.
+        </div>
+      </div>
+      <div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap"}}>
+        <div style={{flex:1,minWidth:140}}>
+          <label style={{display:"block",fontSize:11,color:C.textSub,marginBottom:5}}>Decimal value</label>
+          <input value={dec} placeholder="e.g. 31712"
+            onChange={e=>{setDec(e.target.value);decode("dec",e.target.value)}}
+            style={{width:"100%",background:C.surface,border:`1.5px solid ${C.border}`,
+              borderRadius:8,padding:"10px 12px",fontSize:16,fontFamily:"monospace",color:C.text,outline:"none"}} />
+        </div>
+        <div style={{flex:1,minWidth:140}}>
+          <label style={{display:"block",fontSize:11,color:C.textSub,marginBottom:5}}>Hex value</label>
+          <input value={hex} placeholder="e.g. 7BE0"
+            onChange={e=>{setHex(e.target.value.toUpperCase());decode("hex",e.target.value)}}
+            style={{width:"100%",background:C.surface,border:`1.5px solid ${C.border}`,
+              borderRadius:8,padding:"10px 12px",fontSize:16,fontFamily:"monospace",color:C.fanuc,outline:"none"}} />
+        </div>
+        <button onClick={()=>{setDec("31712");setHex("7BE0");decode("dec","31712")}}
+          style={{alignSelf:"flex-end",padding:"10px 14px",background:C.fanucDim,
+            border:`1px solid ${C.fanuc}44`,borderRadius:8,color:C.fanuc,fontSize:12,
+            fontWeight:600,cursor:"pointer",whiteSpace:"nowrap"}}>
+          Try example
+        </button>
+      </div>
+      {val !== null && (
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:11,color:C.textSub,marginBottom:6}}>Binary — bits 15 → 0</div>
+          <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
+            {Array.from({length:16},(_,i)=>15-i).map(i=>{
+              const bit=(val>>i)&1;
+              const rel=[14,13,12,11,10,9,8,7,6,5].includes(i);
+              const ok=bit===1;
+              return (
+                <div key={i} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
+                  <div style={{width:30,height:30,display:"flex",alignItems:"center",justifyContent:"center",
+                    borderRadius:5,fontFamily:"monospace",fontSize:13,fontWeight:600,
+                    background:!rel?C.surface:ok?C.greenDim:C.redDim,
+                    border:`1.5px solid ${!rel?C.border:ok?C.green:C.red}`,
+                    color:!rel?C.textDim:ok?C.green:C.red}}>{bit}</div>
+                  <div style={{fontSize:9,color:rel?(ok?C.green:C.red):C.textDim,fontFamily:"monospace"}}>{i}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      {val !== null && (
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {bits.map(b=>{
+            const ok=((val>>b.n)&1)===1;
+            const isRoot=b===firstFail;
+            return (
+              <div key={b.n} style={{
+                background: (!ok && doneMap[b.n]) ? C.greenDim : ok ? C.greenDim : C.redDim,
+                border:`${isRoot&&!doneMap[b.n]?"2px":"1px"} solid ${(!ok&&doneMap[b.n])||ok ? C.green : C.red}`,
+                borderRadius:10,padding:"12px 12px",
+                transition:"background 0.3s ease, border-color 0.3s ease",
+              }}>
+                {/* Bit header */}
+                <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:4}}>
+                  <span style={{fontSize:12,fontFamily:"monospace",fontWeight:700,
+                    color:(!ok&&doneMap[b.n])||ok ? C.green : C.red}}>
+                    bit #{b.n} — {b.name}
+                  </span>
+                  <span style={{fontSize:11,fontWeight:500,padding:"1px 8px",borderRadius:6,
+                    background:C.surface,color:(!ok&&doneMap[b.n])||ok ? C.green : C.red}}>
+                    {ok ? "1 — OK" : doneMap[b.n] ? "✓ Resolved" : "0 — FAIL"}
+                  </span>
+                  {isRoot&&!doneMap[b.n]&&<span style={{fontSize:11,fontWeight:700,padding:"2px 8px",borderRadius:6,
+                    background:C.red,color:"#fff"}}>root cause</span>}
+                </div>
+                {/* Bit label */}
+                <div style={{fontSize:12,color:((!ok&&doneMap[b.n])||ok)?C.green+"bb":C.red+"bb",marginBottom:!ok?6:0}}>
+                  {b.label}
+                </div>
+                {/* Fail context + checklist */}
+                {!ok && <>
+                  <div style={{fontSize:12,color:doneMap[b.n]?C.green+"99":"#ffaaaa",lineHeight:1.55,paddingTop:6,
+                    borderTop:`1px solid ${doneMap[b.n]?C.green+"33":C.red+"33"}`,marginBottom:2}}>
+                    {b.context}
+                  </div>
+                  <BitChecklist
+                    steps={b.steps}
+                    onComplete={(done) => setDoneMap(prev => ({...prev, [b.n]: done}))}
+                  />
+                </>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {val===null&&<div style={{textAlign:"center",padding:"2rem",color:C.textDim,fontSize:13}}>Enter the DGN 358 value from the CNC screen</div>}
+      {val!==null&&!firstFail&&(
+        <div style={{background:C.greenDim,border:`1px solid ${C.green}44`,borderRadius:10,
+          padding:"10px 14px",marginTop:10,fontSize:13,color:C.green,lineHeight:1.6}}>
+          All bits OK — startup sequence completed normally. Check FSSB optical cable connection between CNC and servo amplifier.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── ALARM CARD: PS FAN (443 / 610 / 9059) ───────────────────────
+// ── AMPLIFIER LED ALARM CARD ─────────────────────────────────────
+// Renders an amplifier (PSM/SVM/SPM) alarm read directly off the 7-segment
+// display, when there is no dedicated CNC-side card for it.
+function AmpLedCard({ unit, entry, kind = "alarm" }) {
+  const unitCol = { PSM: C.fanuc, SVM: C.red, SPM: C.blue };
+  const unitDim = { PSM: C.fanucDim, SVM: C.redDim, SPM: C.blueDim };
+  const col = unitCol[unit] || C.fanuc;
+  const dim = unitDim[unit] || C.fanucDim;
+  const isError = kind === "error";
+  return (
+    <div>
+      <div style={{background:`linear-gradient(135deg,${isError?C.orangeDim:dim},#0a0d1a)`,
+        border:`1px solid ${(isError?C.orange:col)}44`,borderRadius:14,padding:"14px 16px",marginBottom:14,
+        display:"flex",alignItems:"center",gap:14}}>
+        <SevenSegDisplay unit={unit} code={entry.code} kind={kind} />
+        <div style={{flex:1}}>
+          <div style={{fontSize:11,fontWeight:700,letterSpacing:1,color:isError?C.orange:col,marginBottom:2}}>
+            {isError ? `SP · ERROR ${entry.code} (ERR LED)` : `${unit} · LED ${entry.code}`}
+          </div>
+          <div style={{fontSize:17,fontWeight:700,color:C.text,letterSpacing:-0.3}}>{entry.title}</div>
+        </div>
+      </div>
+
+      {isError && (
+        <div style={{background:C.orangeDim,border:`1px solid ${C.orange}44`,borderRadius:10,
+          padding:"10px 14px",marginBottom:14,fontSize:12.5,color:C.orange,lineHeight:1.6}}>
+          <strong>Status error, not an alarm.</strong> The ERR (yellow) LED is lit and the motor is usually
+          held off until the sequence or parameter is corrected. Also shown on the CNC diagnosis screen:
+          DGN 710 (1st spindle) / 711 (2nd) / 730 (3rd) / 731 (4th); DGN 1561 on FS15i.
+        </div>
+      )}
+
+      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,
+        padding:"10px 14px",marginBottom:14,fontSize:13,color:C.textSub,lineHeight:1.6}}>
+        {entry.desc}
+      </div>
+
+      {entry.steps && entry.steps.length > 0 && <AlarmChecklist steps={entry.steps} />}
+
+      <div style={{marginTop:10,fontSize:11,color:C.textDim}}>
+        Source: {entry.source || "B-65285EN §4.3.3"}
+      </div>
+    </div>
+  );
+}
+
+function PsFanCard() {
+  const rawSteps = [
+    {
+      title: "Power off — confirm DC link discharged (< 30V)",
+      detail: "Power off CNC and main cabinet. Measure DC link voltage at amplifier terminals — wait until below 30 VDC before touching anything.",
+      warn: "Capacitors hold lethal charge after shutdown.",
+    },
+    {
+      title: "Pull PS control board and replace the cooling fan",
+      detail: "Disconnect all connectors from the PS control circuit board (photograph or label first). Slide board out. The fan is mounted on this board. Replace the fan, push board firmly back until fully seated, reconnect all connectors. Power on — confirm PS 7-segment shows '0' and all alarms clear.",
+    },
+    {
+      title: "If alarm returns — replace the PS control circuit board",
+      detail: "New fan but alarm reoccurs = circuit board itself is faulty. Replace the PS control PCB.",
+    },
+  ];
+  const causes = [
+    {title: "Fan"},
+    {title: "Circuit board"},
+  ];
+  const survey = useAlarmSurvey('psfan', causes);
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{background:`linear-gradient(135deg,${C.redDim},#1a0a0a)`,
+        border:`1px solid ${C.red}44`,borderRadius:14,padding:"14px 16px",marginBottom:14}}>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>
+          <Badge label="SV0443" />
+          <Badge label="SV0610" />
+          <Badge label="SP9059" />
+        </div>
+        <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:12}}>
+          <div>
+            <div style={{fontSize:18,fontWeight:700,color:C.text,letterSpacing:-0.3,marginBottom:4}}>CNV. Cooling Fan Failure</div>
+            <div style={{fontSize:12,color:C.textSub,lineHeight:1.5}}>Multiple axes simultaneously + SPN: Cooling Fan Stop in PSM</div>
+          </div>
+          <SevenSegDisplay unit="PSM" code="2" />
+        </div>
+      </div>
+
+      {/* Rule */}
+      <div style={{background:C.orangeDim,border:`1px solid ${C.orange}44`,borderRadius:10,
+        padding:"10px 14px",marginBottom:14,fontSize:13,color:C.orange,lineHeight:1.6}}>
+        <strong style={{display:"block",marginBottom:3}}>⚠ Two possible causes — fan or circuit board</strong>
+        When 443 and 610 appear on multiple axes simultaneously with spindle alarm 9059: the cooling fan on the PS control circuit board has stopped, or the circuit board itself is faulty. Replace the fan first — if alarm returns, the board is the cause.
+      </div>
+
+      {/* Checklist */}
+      <AlarmChecklist steps={rawSteps} />
+
+      {/* Expected result */}
+      <div style={{background:C.greenDim,border:`1px solid ${C.green}44`,borderRadius:10,
+        padding:"10px 14px",marginTop:12,fontSize:12,color:C.green,lineHeight:1.6}}>
+        <strong>Expected result:</strong> All alarms clear. PS 7-segment → "0" ready. Machine operational.
+      </div>
+      <AlarmSurvey steps={causes} counts={survey.counts} onSubmit={survey.submit} submitted={survey.submitted} total={survey.total} />
+    </div>
+  );
+}
+
+// ── ALARM CARD: SV0027 / SV0417 ─────────────────────────────────
+// ── ALARM CARD: PULSECODER / DETECTOR (SV0361-0369, SV0380-0387) ──
+// Alarm number → device type + specific fault (per B-65285EN §3.3.7 tables, pp.78-80)
+const ENCODER_ALARMS = {
+  "361":{dev:"built-in", fault:"Phase data / communication error"},
+  "362":{dev:"built-in", fault:"Speed count error"},
+  "363":{dev:"built-in", fault:"Clock error"},
+  "364":{dev:"built-in", fault:"Soft phase alarm"},
+  "365":{dev:"built-in", fault:"LED error"},
+  "366":{dev:"built-in", fault:"Pulse error"},
+  "367":{dev:"built-in", fault:"Count error"},
+  "368":{dev:"built-in", fault:"Serial data error — no data received"},
+  "369":{dev:"built-in", fault:"Data transfer error — CRC / stop bit"},
+  "380":{dev:"separate", fault:"LED error"},
+  "381":{dev:"separate", fault:"Phase alarm (linear scale)"},
+  "382":{dev:"separate", fault:"Count error"},
+  "383":{dev:"separate", fault:"Pulse error"},
+  "384":{dev:"separate", fault:"Soft phase alarm"},
+  "385":{dev:"separate", fault:"Serial data error — no data received"},
+  "386":{dev:"separate", fault:"Data transfer error — CRC / stop bit"},
+  "387":{dev:"separate", fault:"Detector internal alarm (sensor)"},
+};
+
+function EncoderAlarmCard() {
+  const [num, setNum] = useState(null);           // selected alarm number
+  const sel = num ? ENCODER_ALARMS[num] : null;
+  const isSeparate = sel && sel.dev === "separate";
+
+  // Steps built from B-65285EN §3.3.7 Actions 1-3 + device replacement.
+  // Order: cable (fast field check) → clean scale (separate only) → device →
+  //        battery (absolute only) → manufacturer (387 only) → noise (last).
+  const steps = [];
+  steps.push({
+    title:"Swap the feedback cable for a known-good one",
+    detail:"Fastest way to make progress — you can't inspect a cable inside a machine, but you can swap it. Fit a known-good cable. Alarm clears → it was the cable. Alarm stays → the device. Also check the connector at the accessible (motor/detector) end for coolant, bent or backed-out pins, and looseness, and reseat it.",
+  });
+  if (isSeparate) {
+    steps.push({
+      title:"Clean the scale and read head",
+      detail:"On a linear scale, chips, coolant film, or a smear causes phase and count errors. Clean the scale strip and read head with the manufacturer's cleaner. Check the read-head gap and mounting, and look for scratches or physical damage.",
+    });
+  }
+  steps.push({
+    title:`Replace the ${isSeparate?"detector / scale":"pulsecoder"}`,
+    detail:`If the cable checks good and the alarm stays, the ${isSeparate?"detector has failed — replace the scale or read head":"pulsecoder has failed — replace it"}. After replacement, perform reference position return (zero return) on the affected axis.`,
+  });
+  steps.push({
+    title:"Absolute encoder only — check the battery",
+    detail:"Applies only to absolute-position encoders. If power was just applied after connecting a new battery, a zero-voltage alarm is normal — turn the power off and on again, then re-establish the reference position. If it stays, the battery went fully flat and position is lost. A voltage-decrease warning means replace the battery soon. Re-establish zero return after any battery event.",
+  });
+  if (num === "387") {
+    steps.push({
+      title:"Contact the detector manufacturer",
+      detail:"SV0387 means the separate detector flagged its own internal alarm condition. Beyond cable and mounting, the manufacturer of the scale/detector has the diagnostic detail — contact them.",
+    });
+  }
+  steps.push({
+    title:"Last resort — noise (intermittent only)",
+    detail:"Only if the alarm is intermittent or shows up after an emergency-stop reset, and cable + device have checked out. There's no way to measure noise — you reduce it and see if the alarm stops: separate the feedback cable from power/servo cables, confirm shield grounding at both ends, add ferrite cores. If the same alarm still comes back after noise protection, replace the device. In the field this is rarely the actual cause.",
+  });
+
+  const causes = [
+    {title:"Feedback cable / connector"},
+    {title:`${isSeparate?"Detector / scale":"Pulsecoder"} failure`},
+    ...(isSeparate?[{title:"Dirty or damaged scale"}]:[]),
+    {title:"Absolute encoder battery"},
+    {title:"Noise (intermittent)"},
+  ];
+  const survey = useAlarmSurvey('sv_encoder', causes);
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{background:`linear-gradient(135deg,${C.redDim},#0a0d1a)`,
+        border:`1px solid ${C.red}44`,borderRadius:14,padding:"14px 16px",marginBottom:14}}>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>
+          <Badge label="SV0361–0369" />
+          <Badge label="SV0380–0387" />
+        </div>
+        <div style={{fontSize:18,fontWeight:700,color:C.text,letterSpacing:-0.3,marginBottom:4}}>Pulsecoder / Detector Alarm</div>
+        <div style={{fontSize:12,color:C.textSub,lineHeight:1.5}}>Feedback error from the position-sensing device or its wiring</div>
+        <InfoTag text="361–369 = built-in pulsecoder (on the motor) · 380–387 = separate detector (linear scale / external encoder)" />
+      </div>
+
+      {/* Rule */}
+      <div style={{background:C.orangeDim,border:`1px solid ${C.orange}44`,borderRadius:10,
+        padding:"10px 14px",marginBottom:14,fontSize:13,color:C.orange,lineHeight:1.6}}>
+        <strong style={{display:"block",marginBottom:3}}>Cable or device — that's almost always it</strong>
+        These alarms come from the feedback cable or the encoder/scale itself. Start at the cable,
+        confirm by swapping, then replace the device. Battery bits matter only on absolute encoders.
+        Noise is the last thing to check, not the first.
+      </div>
+
+      {/* Alarm number picker */}
+      <div style={{marginBottom:14}}>
+        <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:8}}>
+          Which alarm number?
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(52px,1fr))",gap:6}}>
+          {Object.keys(ENCODER_ALARMS).map(k=>(
+            <button key={k} onClick={()=>setNum(k===num?null:k)}
+              style={{padding:"8px 4px",borderRadius:8,fontSize:13,fontWeight:600,cursor:"pointer",
+                background: num===k ? C.fanuc : C.card,
+                color: num===k ? "#000" : C.text,
+                border:`1px solid ${num===k?C.fanuc:C.border}`}}>
+              {k}
+            </button>
+          ))}
+        </div>
+        {sel && (
+          <div style={{marginTop:10,background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px"}}>
+            <div style={{fontSize:13,color:C.text,fontWeight:600,marginBottom:2}}>SV0{num} — {sel.fault}</div>
+            <div style={{fontSize:12,color:C.textSub}}>
+              {sel.dev==="separate"?"Separate detector (linear scale / external encoder)":"Built-in pulsecoder (on the motor)"}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {!sel && (
+        <div style={{textAlign:"center",padding:"24px 20px",color:C.textDim,fontSize:13,lineHeight:1.6}}>
+          Select your alarm number above to load the troubleshooting steps.
+        </div>
+      )}
+
+      {sel && <>
+      {/* Checklist */}
+      <AlarmChecklist steps={steps} />
+
+      {/* Source */}
+      <div style={{marginTop:10,fontSize:11,color:C.textDim}}>
+        Source: B-65285EN §3.3.7 (pp.78–80)
+      </div>
+      <AlarmSurvey steps={causes} counts={survey.counts} onSubmit={survey.submit} submitted={survey.submitted} total={survey.total} />
+      </>}
+    </div>
+  );
+}
+
+function SV417Card() {
+  const [showDgn280, setShowDgn280] = useState(false);
+  const [showDgn352, setShowDgn352] = useState(false);
+  const rawSteps = [
+    {
+      title: "Scroll through known servo parameters — are others wrong too?",
+      detail: "Check the parameters you know by heart for this machine: P2020 (motor type), P2022 (rotation direction — must be 111 or −111), P2023 (velocity pulses), P2024 (position pulses), P1023 (servo axis number). If multiple values are wrong or zeroed out, this is SRAM memory loss — go straight to step 2. If only one parameter looks wrong, someone likely changed it manually — skip to step 3.",
+    },
+    {
+      title: "SRAM memory loss — restore parameter backup",
+      detail: "If multiple parameters are corrupted, the SRAM battery is dead or the board has a fault. Restore from whatever backup is available — full SRAM image or parameter file only. After restore, power cycle. If no backup exists, all servo parameters must be re-entered manually from the machine builder's documentation. Check the battery voltage and replace if low.",
+    },
+    {
+      title: "Single parameter wrong — check Alarm 4 on servo screen",
+      detail: "On the servo adjustment screen, check Alarm 4 — look at bit 4 (PRM). PRM = 0: alarm detected by system software → read DGN 280. PRM = 1: alarm detected by servo software → read DGN 352.",
+    },
+    {
+      title: "Use DGN 280 or DGN 352 to identify the bad parameter",
+      detail: "Open the reference tables below to decode the diagnostic value. When more than one alarm exists, only one cause is displayed — fix it, power cycle, and check again.",
+    },
+    {
+      title: "Correct the parameter and power cycle",
+      detail: "Enable parameter write: OFFSET/SETTING → PWE = 1. Correct the identified parameter using machine builder documentation or B-65270EN parameter manual. Power off completely, wait 10 seconds, power on. If alarm returns, re-read DGN — another parameter may also be bad. Repeat until clear.",
+    },
+    {
+      title: "If alarm keeps returning after correct values are set",
+      detail: "Parameters won't hold = SRAM board fault or dead battery. Replace the battery first. If the problem persists after battery replacement, the SRAM or main CPU board needs replacement. Back up all parameters immediately after any successful correction.",
+    },
+  ];
+  const causes = [
+    {title: "Manual parameter change (operator/service)"},
+    {title: "SRAM memory loss (dead battery)"},
+    {title: "SRAM board fault"},
+    {title: "Parameter restore from wrong backup"},
+  ];
+  const survey = useAlarmSurvey('sv417', causes);
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{background:`linear-gradient(135deg,${C.redDim},#0a0d1a)`,
+        border:`1px solid ${C.red}44`,borderRadius:14,padding:"14px 16px",marginBottom:14}}>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>
+          <Badge label="SV0027" />
+          <Badge label="SV0417" />
+        </div>
+        <div style={{fontSize:18,fontWeight:700,color:C.text,letterSpacing:-0.3,marginBottom:4}}>Digital Servo Parameter Error</div>
+        <div style={{fontSize:12,color:C.textSub,lineHeight:1.5}}>Illegal value in servo parameters — value out of range or internal calculation overflow</div>
+        <InfoTag text="SV0027 on Series 15i · SV0417 on all other series" />
+      </div>
+
+      {/* Rule */}
+      <div style={{background:C.orangeDim,border:`1px solid ${C.orange}44`,borderRadius:10,
+        padding:"10px 14px",marginBottom:14,fontSize:13,color:C.orange,lineHeight:1.6}}>
+        <strong style={{display:"block",marginBottom:3}}>Parameters don't change by themselves</strong>
+        Either someone changed a parameter, or memory lost its contents (dead battery / SRAM fault).
+        First check other known parameters — if many are wrong, restore backup immediately.
+        If only one is wrong, use DGN 280 or 352 to identify it.
+      </div>
+
+      {/* Checklist */}
+      <AlarmChecklist steps={rawSteps} />
+
+      {/* Collapsible DGN 280 reference */}
+      <button onClick={() => setShowDgn280(!showDgn280)} style={{
+        width:"100%",marginTop:12,padding:"10px 14px",borderRadius:10,cursor:"pointer",
+        background:C.card,border:`1px solid ${C.border}`,textAlign:"left",
+        display:"flex",justifyContent:"space-between",alignItems:"center",
+      }}>
+        <span style={{fontSize:13,fontWeight:600,color:C.text}}>DGN 280 — System-Detected Alarms (PRM = 0)</span>
+        <span style={{fontSize:16,color:C.fanuc}}>{showDgn280 ? "▲" : "▼"}</span>
+      </button>
+      {showDgn280 && (
+        <div style={{background:C.card,border:`1px solid ${C.border}`,borderTop:"none",
+          borderRadius:"0 0 10px 10px",padding:"10px 14px",fontSize:12,color:C.textSub,lineHeight:1.9}}>
+          <strong style={{color:C.fanuc}}>bit 0 (MOT)</strong> — P2020 motor type number out of valid range<br/>
+          <strong style={{color:C.fanuc}}>bit 2 (PLC)</strong> — P2023 velocity feedback pulses ≤ 0<br/>
+          <strong style={{color:C.fanuc}}>bit 3 (PLS)</strong> — P2024 position feedback pulses ≤ 0<br/>
+          <strong style={{color:C.fanuc}}>bit 4 (DIR)</strong> — P2022 rotation direction not 111 or −111<br/>
+          <strong style={{color:C.fanuc}}>bit 6 (AXS)</strong> — P1023 servo axis number set incorrectly<br/>
+          <span style={{color:C.textDim,fontSize:11}}>16i series and later. When PRM = 0, these bits identify the cause.</span>
+        </div>
+      )}
+
+      {/* Collapsible DGN 352 reference */}
+      <button onClick={() => setShowDgn352(!showDgn352)} style={{
+        width:"100%",marginTop:8,padding:"10px 14px",borderRadius:10,cursor:"pointer",
+        background:C.card,border:`1px solid ${C.border}`,textAlign:"left",
+        display:"flex",justifyContent:"space-between",alignItems:"center",
+      }}>
+        <span style={{fontSize:13,fontWeight:600,color:C.text}}>DGN 352 — Servo-Software Detail Numbers (PRM = 1)</span>
+        <span style={{fontSize:16,color:C.fanuc}}>{showDgn352 ? "▲" : "▼"}</span>
+      </button>
+      {showDgn352 && (
+        <div style={{background:C.card,border:`1px solid ${C.border}`,borderTop:"none",
+          borderRadius:"0 0 10px 10px",padding:"10px 14px",fontSize:11,color:C.textSub,lineHeight:1.8}}>
+          <div style={{marginBottom:8,fontSize:12,color:C.text}}>
+            <strong>How to read:</strong> upper digits = parameter location, lowest digit = cause<br/>
+            <span style={{color:C.fanuc}}>2</span> = invalid value · <span style={{color:C.fanuc}}>3</span> = out of range / not set · <span style={{color:C.fanuc}}>4–9</span> = internal overflow
+          </div>
+          <div style={{borderTop:`1px solid ${C.border}`,paddingTop:8}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+              <thead><tr style={{color:C.fanuc,textAlign:"left"}}>
+                <th style={{padding:"2px 6px"}}>Detail</th>
+                <th style={{padding:"2px 6px"}}>Param (30i/16i)</th>
+                <th style={{padding:"2px 6px"}}>Param (15i)</th>
+                <th style={{padding:"2px 6px"}}>Cause</th>
+              </tr></thead>
+              <tbody style={{color:C.textSub}}>
+              {[
+                ["83",  "2008", "—",    "Learning control params illegal"],
+                ["233", "2023", "1876", "Velocity pulses > 13100"],
+                ["243", "2024", "1891", "Position pulses > 13100"],
+                ["434/435","2043","1855","Velocity loop integral gain overflow"],
+                ["443–445","2044","1856","Velocity loop proportional gain overflow"],
+                ["474/475","2047","1859","Observer param (POA1) overflow"],
+                ["534/535","2053","1865","Dead zone compensation overflow"],
+                ["544/545","2054","1866","Dead zone compensation overflow"],
+                ["686–688","2068","1961","Feed-forward coefficient overflow"],
+                ["694–696","2069","1962","Velocity feed-forward overflow"],
+                ["843", "2084", "1977", "Flexible feed gear numerator invalid"],
+                ["853", "2085", "1978", "Flexible feed gear denominator invalid"],
+                ["883", "2088", "1981", "Machine velocity feedback coeff > 100"],
+                ["1182","2118", "1729", "Dual position FB coefficient not set"],
+                ["1793","2622", "—",    "Position pulse conversion coeff invalid"],
+                ["10033","2004","1809", "Control cycle setting invalid"],
+                ["10092–10093","2004/2013","1809/1707","HRV setting invalid"],
+                ["10103","2004/2013","—", "Different control cycles in one CPU"],
+              ].map((r,i) => (
+                <tr key={i} style={{borderTop:`1px solid ${C.border}22`}}>
+                  <td style={{padding:"3px 6px",color:C.fanuc,fontFamily:"monospace"}}>{r[0]}</td>
+                  <td style={{padding:"3px 6px",fontFamily:"monospace"}}>{r[1]}</td>
+                  <td style={{padding:"3px 6px",fontFamily:"monospace"}}>{r[2]}</td>
+                  <td style={{padding:"3px 6px"}}>{r[3]}</td>
+                </tr>
+              ))}
+              </tbody>
+            </table>
+            <div style={{marginTop:6,color:C.textDim,fontSize:10}}>
+              30i/16i: read DGN 352 · 15i: servo alarm screen lower-left · Full table: B-65270EN §2.1.8
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Source */}
+      <div style={{marginTop:10,fontSize:11,color:C.textDim}}>
+        Source: B-65270EN §2.1.8 · B-65285EN §3.3.6
+      </div>
+      <AlarmSurvey steps={causes} counts={survey.counts} onSubmit={survey.submit} submitted={survey.submitted} total={survey.total} />
+    </div>
+  );
+}
+
+// ── ALARM CARD: OT0500 / OT0501 ─────────────────────────────────
+function OTCard() {
+  const [dir, setDir] = useState(null);
+
+  const jogDetail = dir === "pos"
+    ? "OT0500 = positive limit hit. Hold OT RELEASE and, in HANDLE mode, jog the axis in the NEGATIVE (−) direction. Move 10–20 mm clear of the switch."
+    : dir === "neg"
+    ? "OT0501 = negative limit hit. Hold OT RELEASE and, in HANDLE mode, jog the axis in the POSITIVE (+) direction. Move 10–20 mm clear of the switch."
+    : "Hold OT RELEASE and jog the axis in the direction AWAY from the switch that tripped. If unsure, try one direction slowly — it moves if correct, stays blocked if wrong.";
+
+  const rawSteps = [
+    {
+      title: "Switch to HANDLE (MPG) mode",
+      detail: "Select HANDLE on the mode selector. Handle gives precise, slow control — the right way to inch off an OT switch. Do not use JOG.",
+    },
+    {
+      title: "Hold OT RELEASE and jog off the limit",
+      detail: jogDetail + " There is no parameter that releases a hardware limit switch — the OT RELEASE button (wired by the MTB) is the way off. (The RLSOT / G007#7 release applies to the STORED software stroke limit, not a hardware switch.)",
+    },
+    {
+      title: "Reset and confirm the alarm clears",
+      detail: "Once clear of the switch, press RESET — the alarm should drop. If it won't clear even after moving off, the switch signal isn't returning to normal — go to the next step.",
+    },
+    {
+      title: "Find what tripped it — watch the switch in PMC status",
+      detail: "Open PMC → STATUS and find this axis's hardware OT input (*+L for positive, *-L for negative). Press and release the OT switch by hand and watch the signal change state. If it does NOT change, either the signal isn't reaching the NC (wiring / connector) or the switch itself is broken. To tell them apart, briefly bypass (short) the switch — if the state changes now, the switch is faulty; if it still doesn't change, the fault is in the wiring or the input. Then inspect the switch, dog/cam and connector, and fix the cause.",
+    },
+  ];
+
+  const survey = useAlarmSurvey('ot500', rawSteps);
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{background:`linear-gradient(135deg,${C.orangeDim},#0a0a0a)`,
+        border:`1px solid ${C.orange}44`,borderRadius:14,padding:"14px 16px",marginBottom:14}}>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>
+          <Badge label="OT0500" />
+          <Badge label="OT0501" />
+        </div>
+        <div style={{fontSize:18,fontWeight:700,color:C.text,letterSpacing:-0.3,marginBottom:4}}>Hardware Overtravel</div>
+        <div style={{fontSize:12,color:C.textSub,lineHeight:1.5}}>OT0500 = positive direction hit · OT0501 = negative direction hit</div>
+      </div>
+
+      {/* Direction selector — affects step 3 detail text */}
+      <div style={{marginBottom:12}}>
+        <div style={{fontSize:11,color:C.textSub,marginBottom:8}}>Which alarm? (updates the jog direction)</div>
+        <div style={{display:"flex",gap:8}}>
+          {[
+            { key:"pos", label:"OT0500 — Positive" },
+            { key:"neg", label:"OT0501 — Negative" },
+          ].map(d => (
+            <button key={d.key} onClick={() => setDir(d.key)}
+              style={{flex:1,padding:"10px 8px",borderRadius:8,fontSize:12,fontWeight:600,cursor:"pointer",
+                background:dir===d.key?C.fanucDim:C.card,
+                color:dir===d.key?C.fanuc:C.textSub,
+                border:`1.5px solid ${dir===d.key?C.fanuc:C.border}`,
+              }}>{d.label}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Rule */}
+      <div style={{background:C.redDim,border:`1px solid ${C.red}44`,borderRadius:10,
+        padding:"10px 14px",marginBottom:14,fontSize:13,color:"#ffaaaa",lineHeight:1.6}}>
+        <strong>Jog in the OPPOSITE direction from the OT that tripped.</strong><br/>
+        OT0500 (+) → jog negative. OT0501 (−) → jog positive.
+        Moving toward the active OT switch will be blocked by the controller.
+      </div>
+
+      {/* Checklist */}
+      <AlarmChecklist steps={survey.orderedSteps} total={survey.total} />
+
+      {/* False-trip note */}
+      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,
+        padding:"12px 14px",marginTop:12,fontSize:12,color:C.textSub,lineHeight:1.6}}>
+        <strong style={{color:C.text,display:"block",marginBottom:4}}>If no physical OT occurred (false trip)</strong>
+        Axis was nowhere near the limit but OT alarm fired = OT switch or wiring failed open (NC contact). Check: switch wiring harness, cabinet connector, switch mechanical actuator arm. Also verify software limits (param 1320/1321) sit inside the hardware OT boundary.
+      </div>
+      <AlarmSurvey steps={rawSteps} counts={survey.counts} onSubmit={survey.submit} submitted={survey.submitted} total={survey.total} />
+    </div>
+  );
+}
+
+// ── ALARM CARD: E-STOP ───────────────────────────────────────────
+function EspCard() {
+  const rawSteps = [
+    {
+      title: "Check the screen — is there also an alarm number?",
+      detail: "EMG blinking on its own — no alarm number — means the emergency-stop chain is open. But if a 1xxx or 2xxx alarm is shown as well, that is a PMC alarm: the cause is in the ladder, not the servo. Look it up in the machine's ladder diagram and deal with that alarm.",
+    },
+    {
+      title: "Watch the EMG input in PMC — almost always X8.4",
+      detail: "SYSTEM → PMC → STATUS and find X8.4, the emergency-stop input (a few builders use a different address). It reads 1 when the chain is closed and 0 when it's open. If it's 0 with every button released, the chain is broken somewhere — use the machine's wiring diagram to trace which contact is open.",
+    },
+    {
+      title: "Find the EMG chain in the machine's electrical book",
+      detail: "EMG is a chain of contacts the machine builder wired together — E-stop buttons, overtravel switches, and whatever other safety inputs the MTB chose. If any one contact opens, EMG comes on. The wiring diagram in the machine's book shows every contact in the chain and is the map for finding the open one.",
+    },
+    {
+      title: "Check the E-stop buttons — do they actually react?",
+      detail: "Every E-stop button (panel and pendant) must be released — pull out and twist to reset. Press and release each one while watching its input in the PMC status table: the signal should change state. A button that doesn't move the signal is faulty or has a stuck contact.",
+    },
+    {
+      title: "Check the overtravel switches in the chain",
+      detail: "On most machines the OT limit switches sit in the EMG chain. If OT0500 or OT0501 is also active, clear that first — EMG stays open while an overtravel is tripped.",
+    },
+    {
+      title: "Check the other inputs the MTB wired into the chain",
+      detail: "The builder decides what else sits in the chain — door/guard interlocks, hydraulic or air pressure switches, safety relay units (Pilz, SICK), an external cell or robot E-stop. The electrical book lists them. Watch each suspect input in the PMC status table to find the one holding the chain open.",
+    },
+    {
+      title: "Reset and confirm EMG clears",
+      detail: "With the chain closed, the EMG indicator should stop blinking and X8.4 should read 1. If EMG returns immediately, watch the PMC status table to catch which input dropped back to 0.",
+    },
+  ];
+
+  const survey = useAlarmSurvey('esp', rawSteps);
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{background:`linear-gradient(135deg,${C.redDim},#0a0a0a)`,
+        border:`1px solid ${C.red}44`,borderRadius:14,padding:"14px 16px",marginBottom:14}}>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8,alignItems:"center"}}>
+          <div style={{background:C.red,color:"#fff",fontWeight:800,fontSize:15,letterSpacing:2,
+            padding:"4px 14px",borderRadius:6,animation:"blink 1s step-start infinite"}}>EMG</div>
+        </div>
+        <div style={{fontSize:18,fontWeight:700,color:C.text,letterSpacing:-0.3,marginBottom:4}}>Emergency Stop</div>
+        <div style={{fontSize:12,color:C.textSub,lineHeight:1.5}}>EMG is blinking on the CNC screen. The emergency-stop chain is open — the machine won't run until every contact in the chain is closed. Often there's no alarm number on the alarm screen at all.</div>
+      </div>
+
+      {/* Rule */}
+      <div style={{background:C.orangeDim,border:`1px solid ${C.orange}44`,borderRadius:10,
+        padding:"10px 14px",marginBottom:14,fontSize:13,color:C.orange,lineHeight:1.6}}>
+        <strong style={{display:"block",marginBottom:3}}>EMG on its own is not a servo fault</strong>
+        It means one contact in the safety chain is open. Don't guess — watch the EMG input in PMC (X8.4) and trace the chain in the machine's electrical book to find exactly which contact dropped. If a 1xxx/2xxx alarm shows too, that's a PMC alarm — go to the ladder.
+      </div>
+
+      {/* Checklist */}
+      <AlarmChecklist steps={survey.orderedSteps} total={survey.total} />
+      <AlarmSurvey steps={rawSteps} counts={survey.counts} onSubmit={survey.submit} submitted={survey.submitted} total={survey.total} />
+    </div>
+  );
+}
+
+// ── ALARM CARD: SV0410 / SV0411 — SERVO EXCESS ERROR ────────────
+function ExcessErrorCard() {
+  const [alarm, setAlarm] = useState(null);
+
+  const rawSteps = [
+    {
+      title: "While alarm is active — check all amplifier 7-segments",
+      detail: "Go to the cabinet while alarm is showing. Read 7-segment on PS, SV, and SP units. Any unit showing a code = that's the root cause, look it up first. Units will show an alarm code or '−' (dash). Even '−' doesn't rule out the amplifier — the fault can originate from any PS/SV/SP in the chain.",
+    },
+    {
+      title: "Open servo tuning screen — observe position error and current",
+      detail: "SYSTEM → [SV.PARA] → [SV.TUN]. Position error in detection units (DGN 300). Motor current as % of rated. "
+        + (alarm === "410"
+          ? "At rest: position error should be 0–5 units. Climbing slowly with no command = feedback drifting. Large fixed value = mechanical load or brake fighting the servo. High current at rest = brake not releasing. Near-zero current with climbing error = encoder/feedback fault."
+          : "During a commanded move: watch both values. Current peaking near 100% before alarm fires = mechanical resistance (lubrication, chips, ballscrew). Low current with position error climbing = electrical fault (power cable, encoder, amplifier)."),
+      note: "If SV.TUN is not available: SETTING → PWE=1, set parameter 3111#0 = 1, then retry.",
+    },
+    {
+      title: "Temporarily widen tolerance — diagnostic confirmation only",
+      detail: (alarm === "410"
+          ? "SYSTEM → PARAM → 1829 → NO.SRH. Note the current value."
+          : "SYSTEM → PARAM → 1828 → NO.SRH. Note the current value.")
+        + " Temporarily raise it. If alarm disappears = deviation was genuinely reaching the limit. If alarm remains = problem is more severe. MTB calculated these limits correctly — restore the original value immediately.",
+      warn: "Restore the original parameter value immediately after this test. Never leave it modified.",
+      note: "For changing parameters: SETTING → PWE=1. After done: set PWE=0.",
+    },
+    {
+      title: "Megger test — power cable and motor together",
+      detail: "Machine OFF. Disconnect the motor power cable at the amplifier. Measure insulation resistance from each phase (U, V, W) to earth. Healthy reads above 10 MΩ. Below 10 MΩ = insulation is already degraded. Below 1 MΩ = breakdown. Coolant ingress into the motor is a very common cause — insulation degrades gradually and may fail only under temperature.",
+      warn: "Confirm DC link voltage has discharged to a safe level before disconnecting any power cables.",
+      note: "Megger at 500 VDC for standard αi motors. For high voltage units (HV series) — test at 1000 VDC.",
+    },
+    {
+      title: "Isolate — disconnect cable at motor, test cable and motor separately",
+      detail: "Disconnect the power cable at the motor terminal box. Megger each part independently: (A) Cable only — each phase to cable armour/screen. (B) Motor only — each winding terminal to motor frame. Whichever reads low is the failed component. Cable failures typically appear at bending points inside the conduit.",
+    },
+    {
+      title: "Check linear scale if fitted",
+      detail: "If the axis uses a separate linear scale: cancel the linear scale in parameters and see if the alarm clears. If yes — the problem is the scale system (dirty/damaged scale, cable, or connector). Clean the scale read-head and glass strip. Check the scale cable for damage at both ends. Check DGN 205 bits for separate detector alarm details.",
+    },
+    {
+      title: "Swap servo amplifier with a confirmed working unit",
+      detail: "If all electrical tests pass but alarm persists: replace the SV amplifier with a confirmed working unit of identical type (check FANUC part number on the label). If alarm follows the old amplifier to a different axis = amplifier is faulty. If alarm stays on the same axis with the new amplifier = amplifier is OK, continue.",
+    },
+    {
+      title: "Replace encoder",
+      detail: "Encoder can cause position feedback errors that appear as excess error. Replace the encoder on the alarming axis motor. After replacement: set reference position (zero return).",
+    },
+    {
+      title: "Mechanical investigation — lubrication, travel, ballscrew",
+      detail: "Work through in order: (1) Way lubrication — oil level, pump running, distributors not blocked, oil visible on the ways. (2) Axis travel — inspect for chips, swarf, or any obstruction. (3) Ballscrew — jog slowly and feel for tight spots; check ballscrew nut for axial play. (4) Motor-to-ballscrew coupling — check for slippage or loose clamp screws. (5) Linear guides — look for scoring, rust, or embedded debris.",
+    },
+  ];
+
+  const causes = [
+    {title: "Servo unit alarm"},
+    {title: "Encoder"},
+    {title: "Mechanical problems"},
+    {title: "Motor cable"},
+    {title: "Motor"},
+    {title: "Scale"},
+  ];
+
+  // Two separate surveys so 410 and 411 keep distinct field statistics.
+  const survey410 = useAlarmSurvey('sv410', causes);
+  const survey411 = useAlarmSurvey('sv411', causes);
+  const survey = alarm === '411' ? survey411 : survey410;
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{background:`linear-gradient(135deg,${C.redDim},#0a0d1a)`,
+        border:`1px solid ${C.red}44`,borderRadius:14,padding:"14px 16px",marginBottom:14}}>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>
+          <Badge label="SV0410" />
+          <Badge label="SV0411" />
+        </div>
+        <div style={{fontSize:18,fontWeight:700,color:C.text,letterSpacing:-0.3,marginBottom:4}}>Servo Excess Error</div>
+        <div style={{fontSize:12,color:C.textSub,lineHeight:1.5}}>
+          SV0410 = position deviation too large at <strong style={{color:C.text}}>stop</strong>
+          {" · "}SV0411 = position deviation too large during <strong style={{color:C.text}}>movement</strong>
+        </div>
+      </div>
+
+      {/* Alarm selector */}
+      <div style={{marginBottom:12}}>
+        <div style={{fontSize:11,color:C.textSub,marginBottom:8}}>Which alarm appeared? (adapts step detail)</div>
+        <div style={{display:"flex",gap:8}}>
+          {[
+            { key:"410", label:"410 — At stop" },
+            { key:"411", label:"411 — During move" },
+          ].map(d => (
+            <button key={d.key} onClick={() => setAlarm(d.key)}
+              style={{flex:1,padding:"10px 8px",borderRadius:8,fontSize:12,fontWeight:600,cursor:"pointer",
+                background:alarm===d.key?C.fanucDim:C.card,
+                color:alarm===d.key?C.fanuc:C.textSub,
+                border:`1.5px solid ${alarm===d.key?C.fanuc:C.border}`,
+              }}>{d.label}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Contextual rule box */}
+      {alarm === "410" && (
+        <div style={{background:C.orangeDim,border:`1px solid ${C.orange}44`,borderRadius:10,
+          padding:"10px 14px",marginBottom:14,fontSize:13,color:C.orange,lineHeight:1.6}}>
+          <strong style={{display:"block",marginBottom:3}}>SV0410 — deviation exceeds limit at standstill</strong>
+          Axis stopped but position drifts past parameter <strong>1829</strong> (secondary: 5312).
+          Field frequency order: motor/cable insulation breakdown → brake not fully releasing → mechanical resistance → encoder feedback drift → parameter set too tight.
+        </div>
+      )}
+      {alarm === "411" && (
+        <div style={{background:C.orangeDim,border:`1px solid ${C.orange}44`,borderRadius:10,
+          padding:"10px 14px",marginBottom:14,fontSize:13,color:C.orange,lineHeight:1.6}}>
+          <strong style={{display:"block",marginBottom:3}}>SV0411 — deviation exceeds limit during movement</strong>
+          Axis cannot follow the commanded path — deviation exceeds parameter <strong>1828</strong> (secondary: 5310).
+          Field frequency order: mechanical overload (lubrication, chips, ballscrew) → motor/cable insulation breakdown → input voltage sag → amplifier fault → servo gain mismatch.
+        </div>
+      )}
+      {alarm === null && (
+        <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,
+          padding:"10px 14px",marginBottom:14,fontSize:13,color:C.textSub,lineHeight:1.6}}>
+          Select which alarm appeared above — step detail adapts to that specific fault mode.
+        </div>
+      )}
+
+      {/* Checklist */}
+      {alarm && <AlarmChecklist key={alarm} steps={rawSteps} />}
+
+      {/* Parameter reference */}
+      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,
+        padding:"10px 14px",marginTop:12,fontSize:12,color:C.textSub,lineHeight:1.9}}>
+        <strong style={{color:C.text}}>Parameter reference</strong><br/>
+        <strong style={{color:C.fanuc}}>1828</strong> — max position deviation during <em>movement</em> → governs SV0411<br/>
+        <strong style={{color:C.fanuc}}>1829</strong> — max position deviation at <em>stop</em> → governs SV0410<br/>
+        <strong style={{color:C.fanuc}}>3111#0 (SVS)</strong> — set to 1 to enable servo tuning screen<br/>
+        Units: CNC detection units. 0.001 mm machine: 1 unit = 1 µm.<br/>
+        MTB set 1828/1829 correctly — change only to confirm alarm, restore immediately.
+      </div>
+      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,
+        padding:"10px 14px",marginTop:8,fontSize:12,color:C.textSub,lineHeight:1.8}}>
+        <strong style={{color:C.text}}>DGN 300 — position error</strong><br/>
+        Formula: error = Feed rate [mm/min] ÷ (60 × loop gain [1/s]) ÷ detection unit<br/>
+        Example: F1000, loop gain 30, 0.001mm machine → normal error during motion ≈ 556 units.<br/>
+        At standstill with no command: should be 0–5 units. Any large value at rest = fault.
+      </div>
+      {alarm && <AlarmSurvey steps={causes} counts={survey.counts} onSubmit={survey.submit} submitted={survey.submitted} total={survey.total} />}
+    </div>
+  );
+}
+
+// ── AMP ALARM PAGE — PSM / SVM / SPM 7-segment decoder ───────────────────
+function AmpAlarmPage({ onNav }) {
+  const [unit, setUnit] = useState("SVM");
+  const [code, setCode] = useState("");
+  // Tap an amp code → open the real CNC alarm card (with checklist), not a thin
+  // amp card. Every PSM/SVM entry carries its CNC alarm number (cnc:"437"…);
+  // SPM 2-digit codes map to spindle alarm 90NN (56 → SP9056).
+  const openCard = (u, c) => {
+    if (!onNav) return;
+    const dbMap = { PSM: PSM_ALARM_DB, SVM: SVM_ALARM_DB, SPM: SPM_ALARM_DB };
+    const entry = (dbMap[u] || []).find(e => e.code.toUpperCase() === String(c).toUpperCase());
+    let card = null;
+    if (entry && entry.cnc) {
+      const num = String(entry.cnc).match(/\d+/);        // first CNC number, e.g. "437"
+      if (num) card = findAlarmByCode(num[0]);
+    }
+    if (!card && u === "SPM") {
+      if (/^\d{1,2}$/.test(c)) card = findAlarmByCode("90" + String(c).padStart(2, "0"));
+      if (!card) card = findAlarmByCode(c);
+    }
+    if (card) { onNav(card.key); return; }
+    onNav(`amp:${u}:${c}`);                               // fallback: amp LED card
+  };
+
+  const db = unit === "PSM" ? PSM_ALARM_DB : unit === "SVM" ? SVM_ALARM_DB : SPM_ALARM_DB;
+  const match = db.find(e => e.code.toUpperCase() === code.trim().toUpperCase());
+
+  const unitCol = { PSM: C.fanuc, SVM: C.red, SPM: C.blue };
+  const unitDim = { PSM: C.fanucDim, SVM: C.redDim, SPM: C.blueDim };
+
+  return (
+    <div style={{padding:"24px 0"}}>
+      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,
+        color:C.textSub,marginBottom:6}}>Amplifier Display</div>
+      <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:-0.5,marginBottom:4}}>
+        7-Segment Alarm Lookup
+      </div>
+      <div style={{fontSize:13,color:C.textSub,lineHeight:1.55,marginBottom:16}}>
+        Select the unit showing the alarm, then enter the code on its display.
+      </div>
+
+      {/* Unit selector */}
+      <div style={{display:"flex",gap:8,marginBottom:16}}>
+        {["PSM","SVM","SPM"].map(u => (
+          <button key={u} onClick={() => { setUnit(u); setCode(""); }}
+            style={{flex:1,padding:"12px 8px",borderRadius:10,fontSize:14,fontWeight:700,
+              cursor:"pointer", background: unit===u ? unitDim[u] : C.card,
+              color: unit===u ? unitCol[u] : C.textSub,
+              border:`1.5px solid ${unit===u ? unitCol[u] : C.border}`}}>
+            {u}
+          </button>
+        ))}
+      </div>
+
+      {/* Code display + input */}
+      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,
+        padding:"16px",marginBottom:16}}>
+        <div style={{display:"flex",alignItems:"center",gap:16,marginBottom:12}}>
+          <SevenSegDisplay unit={unit} code={code || (unit==="SPM" ? "??" : "?")} />
+          <div style={{flex:1}}>
+            <div style={{fontSize:11,color:C.textSub,marginBottom:6}}>
+              {unit === "SPM" ? "Enter 2-digit code (e.g. 09, 12)" : "Enter 1-character code (e.g. 8, E, A)"}
+            </div>
+            <input
+              value={code}
+              onChange={e => setCode(e.target.value.toUpperCase().slice(0, unit==="SPM"?2:2))}
+              placeholder={unit === "SPM" ? "09" : "8"}
+              style={{width:"100%",background:C.surface,border:`1.5px solid ${unitCol[unit]}55`,
+                borderRadius:8,padding:"10px 14px",fontSize:28,fontFamily:"monospace",
+                fontWeight:900,color:unitCol[unit],outline:"none",letterSpacing:4,
+                textTransform:"uppercase"}}
+            />
+          </div>
+        </div>
+
+        {/* Result — tap to open the full alarm guide */}
+        {code.trim() && match && (
+          <button onClick={() => openCard(unit, match.code)}
+            style={{width:"100%",textAlign:"left",cursor:"pointer",
+              background: unitDim[unit], border:`1px solid ${unitCol[unit]}44`,
+              borderRadius:10,padding:"12px 14px"}}>
+            <div style={{fontSize:16,fontWeight:700,color:unitCol[unit],marginBottom:6}}>
+              {match.title}
+            </div>
+            <div style={{fontSize:14,color:C.textSub,lineHeight:1.65,marginBottom: match.cnc ? 8 : 0}}>
+              {match.desc}
+            </div>
+            {match.cnc && (
+              <div style={{fontSize:12,color:C.textDim,marginTop:4}}>
+                Related CNC alarm: <span style={{color:C.fanuc,fontWeight:700}}>{match.cnc}</span>
+              </div>
+            )}
+            <div style={{marginTop:10,fontSize:13,fontWeight:700,color:unitCol[unit]}}>Open full guide →</div>
+          </button>
+        )}
+        {code.trim() && !match && (
+          <div style={{background:C.orangeDim,border:`1px solid ${C.orange}44`,
+            borderRadius:10,padding:"10px 14px",fontSize:13,color:C.orange}}>
+            Code "{code}" not found in {unit} alarm table.
+          </div>
+        )}
+      </div>
+
+      {/* Full code list for this unit */}
+      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:0.8,
+        color:C.textSub,marginBottom:8}}>All {unit} alarm codes</div>
+      <div style={{display:"flex",flexDirection:"column",gap:6}}>
+        {db.map((e,i) => (
+          <button key={i} onClick={() => openCard(unit, e.code)}
+            style={{background:C.card, border:`1px solid ${C.border}`,
+              borderRadius:10,padding:"10px 12px",
+              display:"flex",alignItems:"center",gap:12,
+              cursor:"pointer",textAlign:"left",width:"100%"}}>
+            <SevenSegDisplay unit={unit} code={e.code} scale={0.6} />
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:14,fontWeight:600,color:C.text,marginBottom:2}}>
+                {e.title}
+              </div>
+              <div style={{fontSize:12,color:C.textSub,lineHeight:1.4}}>
+                {e.desc.slice(0, 80)}{e.desc.length > 80 ? "…" : ""}
+              </div>
+            </div>
+            <span style={{fontSize:16,color:C.textDim,flexShrink:0}}>›</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── GENERIC AUTHORED ALARM CARD ──────────────────────────────────
+// ── AMP 7-SEG CROSS-REFERENCE STRIP ──────────────────────────────
+// Shows the amplifier faceplate reading(s) that mean the same fault as
+// this CNC alarm. Fully derived from the amp DBs — never hand-maintained,
+// so it can't drift and it covers every mapping automatically. Tapping a
+// chip opens that amplifier LED card (bidirectional navigation).
+// ── CONVERTER-FAULT REDIRECT BANNER ──────────────────────────────
+// For the five spindle alarms that are really αiPS converter faults, the number
+// on the CNC screen (SP90xx) is only the spindle path reporting a PS fault. The
+// solution lives on the PS converter card — send the tech straight there.
+function ConverterRedirectBanner({ alarm, onNav }) {
+  const r = alarm && SP_CONVERTER_REDIRECT[alarm.key];
+  if (!r) return null;
+  const ps = findAlarmByKey(r.psKey);
+  const psCode = ps ? (ps.codes.find(c => /[A-Za-z]/.test(c)) || ps.codes[0]) : r.psKey;
+  const tappable = !!onNav && !!ps;
+  return (
+    <div onClick={tappable ? () => onNav(r.psKey) : undefined}
+      style={{background:`linear-gradient(135deg,${C.fanucDim},#0a0d1a)`,
+        border:`1px solid ${C.fanuc}`, borderRadius:12, padding:"12px 14px",
+        marginBottom:14, cursor: tappable ? "pointer" : "default"}}>
+      <div style={{fontSize:11, fontWeight:800, letterSpacing:0.5, color:C.fanuc, marginBottom:5}}>
+        ⚡ THIS IS A CONVERTER (PS) FAULT
+      </div>
+      <div style={{fontSize:13, color:C.textSub, lineHeight:1.55, marginBottom:9}}>
+        The spindle amp only reports it — the SPM shows the spindle number while the
+        αiPS faceplate shows <strong style={{color:C.fanuc}}>{r.ps}</strong>. The fault and the
+        fix are converter-side. Solve it on the PS card:
+      </div>
+      <div style={{display:"flex", alignItems:"center", gap:10, background:C.surface,
+        border:`1px solid ${C.fanuc}66`, borderRadius:10, padding:"9px 11px"}}>
+        <div style={{flex:1, minWidth:0}}>
+          <div style={{fontSize:10, fontWeight:700, color:C.fanuc, marginBottom:2}}>{psCode} · PS SOLUTION</div>
+          <div style={{fontSize:13, fontWeight:600, color:C.text}}>{ps ? ps.title : "Converter alarm"}</div>
+        </div>
+        {tappable && <span style={{color:C.fanuc, fontSize:18}}>›</span>}
+      </div>
+    </div>
+  );
+}
+
+// Read-only reference: shows what this same fault reads as on the amplifier's
+// physical 7-segment faceplate. A tech at the cabinet often reads the amp LED,
+// not the CNC screen — this bridges the two numbers. Not tappable: the fix is
+// the checklist right here on this card, not a jump to another card.
+function AmpXrefStrip({ codes, type }) {
+  const links = ampXrefForCodes(codes, type);
+  if (!links.length) return null;
+  const unitCol = { PSM: C.fanuc, SVM: C.red, SPM: C.blue };
+  return (
+    <div style={{background:C.card, border:`1px solid ${C.border}`, borderRadius:12,
+      padding:"11px 13px", marginBottom:14}}>
+      <div style={{fontSize:10, fontWeight:700, letterSpacing:0.5, textTransform:"uppercase",
+        color:C.textSub, marginBottom:9}}>
+        On the amplifier 7-segment display
+      </div>
+      <div style={{display:"flex", flexWrap:"wrap", gap:8}}>
+        {links.map((l, i) => (
+          <div key={i}
+            style={{display:"flex", alignItems:"center", gap:11, flex:"1 1 240px",
+              background:C.surface, border:`1px solid ${unitCol[l.unit]}44`,
+              borderRadius:10, padding:"9px 11px"}}>
+            <SevenSegDisplay unit={l.unit} code={l.code} scale={0.68} />
+            <div style={{minWidth:0, flex:1}}>
+              <div style={{fontSize:12, fontWeight:600, color:C.text, lineHeight:1.4}}>{l.title}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Data-driven card for any ALARM_DB entry that has steps[].
+// Renders the same layout as the hand-built cards (PsFanCard, SV417Card etc.)
+function GenericAuthoredCard({ alarm, onNav }) {
+  const numericCodes = alarm.codes.filter(c => /^\d/.test(c));
+  const sevColor = alarm.severity === "high" ? C.red : alarm.severity === "med" ? C.orange : C.green;
+  const cat    = alarmCategory(alarm);
+  const catCol = CAT_COLORS[cat] || C.fanuc;
+  const primary = numericCodes[0] || alarm.codes[0] || "";
+  const extra   = numericCodes.slice(1, 4);
+
+  const causes = alarm.causes
+    ? alarm.causes.map(c => ({title: c}))
+    : alarm.steps.map(s => ({title: s.title.slice(0,40)}));
+  const survey = useAlarmSurvey(alarm.key, causes);
+
+  return (
+    <div>
+      {/* Header — tinted by subject (category); icon + big alarm number; severity dot */}
+      <div style={{background:`linear-gradient(135deg,${catCol}26,#0a0a0a)`,
+        border:`1px solid ${catCol}55`,borderRadius:14,padding:"14px 16px",marginBottom:14}}>
+        <div style={{display:"flex",alignItems:"center",gap:13}}>
+          {/* Category icon tile — top-left, left of the alarm number */}
+          <div style={{width:48,height:48,borderRadius:12,flexShrink:0,
+            background:`${catCol}1f`,border:`1px solid ${catCol}55`,
+            display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <CatIcon type={cat} col={catCol} size={28} />
+          </div>
+          {/* Alarm number — primary big, extras as tinted chips */}
+          <div style={{flex:1,minWidth:0,display:"flex",alignItems:"baseline",gap:8,flexWrap:"wrap"}}>
+            <span style={{fontSize:30,fontWeight:800,fontFamily:"'JetBrains Mono',monospace",
+              color:catCol,letterSpacing:-0.5,lineHeight:1}}>{primary}</span>
+            {extra.map(c => (
+              <span key={c} style={{fontSize:12,fontWeight:600,fontFamily:"'JetBrains Mono',monospace",
+                padding:"2px 7px",borderRadius:4,background:`${catCol}1f`,color:catCol}}>{c}</span>
+            ))}
+          </div>
+        </div>
+        {/* Title + description */}
+        <div style={{marginTop:12}}>
+          <div style={{fontSize:18,fontWeight:700,color:C.text,letterSpacing:-0.3,marginBottom:4}}>
+            {alarm.title}
+          </div>
+          <div style={{fontSize:12,color:C.textSub,lineHeight:1.5}}>{alarm.desc}</div>
+        </div>
+      </div>
+
+      {/* Converter-fault redirect — send spindle-reported PS faults to the PS card */}
+      <ConverterRedirectBanner alarm={alarm} onNav={onNav} />
+
+      {/* Amp 7-seg cross-reference — derived, always in sync with the amp DBs */}
+      <AmpXrefStrip codes={alarm.codes} type={alarm.type} />
+
+      {/* Rule / context box */}
+      {alarm.context && (
+        <div style={{background:C.orangeDim,border:`1px solid ${C.orange}44`,borderRadius:10,
+          padding:"10px 14px",marginBottom:14,fontSize:13,color:C.orange,lineHeight:1.6}}>
+          {alarm.summary && <strong style={{display:"block",marginBottom:3}}>{alarm.summary}</strong>}
+          {alarm.context}
+        </div>
+      )}
+
+      {/* Checklist */}
+      <AlarmChecklist steps={alarm.steps} />
+
+      {/* Source reference */}
+      {alarm.source && (
+        <div style={{marginTop:12,fontSize:11,color:C.textDim,textAlign:"right"}}>
+          Source: {alarm.source}
+        </div>
+      )}
+
+      {/* Survey */}
+      <AlarmSurvey steps={causes} counts={survey.counts} onSubmit={survey.submit} submitted={survey.submitted} total={survey.total} />
+    </div>
+  );
+}
+
+// ── SKELETON ALARM CARD ──────────────────────────────────────────
+// Uniform placeholder for alarms in ALARM_DB that haven't been authored
+// with a custom card yet. Shows known info + survey + "content pending" note.
+function SkeletonAlarmCard({ alarm, onNav }) {
+  const numericCodes = alarm.codes.filter(c => /^\d/.test(c));
+  const sevColor = alarm.severity === "high" ? C.red : alarm.severity === "med" ? C.orange : C.green;
+  const cat    = alarmCategory(alarm);
+  const catCol = CAT_COLORS[cat] || C.fanuc;
+  const primary = numericCodes[0] || alarm.codes[0] || "";
+  const extra   = numericCodes.slice(1, 4);
+
+  return (
+    <div>
+      {/* Header — tinted by subject (category); icon + big alarm number */}
+      <div style={{background:`linear-gradient(135deg,${catCol}26,#0a0a0a)`,
+        border:`1px solid ${catCol}55`,borderRadius:14,padding:"14px 16px",marginBottom:14}}>
+        <div style={{display:"flex",alignItems:"center",gap:13}}>
+          <div style={{width:48,height:48,borderRadius:12,flexShrink:0,
+            background:`${catCol}1f`,border:`1px solid ${catCol}55`,
+            display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <CatIcon type={cat} col={catCol} size={28} />
+          </div>
+          <div style={{flex:1,minWidth:0,display:"flex",alignItems:"baseline",gap:8,flexWrap:"wrap"}}>
+            <span style={{fontSize:30,fontWeight:800,fontFamily:"'JetBrains Mono',monospace",
+              color:catCol,letterSpacing:-0.5,lineHeight:1}}>{primary}</span>
+            {extra.map(c => (
+              <span key={c} style={{fontSize:12,fontWeight:600,fontFamily:"'JetBrains Mono',monospace",
+                padding:"2px 7px",borderRadius:4,background:`${catCol}1f`,color:catCol}}>{c}</span>
+            ))}
+          </div>
+          <span style={{flexShrink:0}}><StubBadge /></span>
+        </div>
+        <div style={{marginTop:12}}>
+          <div style={{fontSize:18,fontWeight:700,color:C.text,letterSpacing:-0.3,marginBottom:4}}>
+            {alarm.title}
+          </div>
+          <div style={{fontSize:12,color:C.textSub,lineHeight:1.5}}>{alarm.desc}</div>
+        </div>
+      </div>
+
+      {/* Amp 7-seg cross-reference — derived, always in sync with the amp DBs */}
+      <AmpXrefStrip codes={alarm.codes} type={alarm.type} />
+
+      {/* Content pending notice */}
+      <div style={{background:C.card,border:`1px dashed ${C.border}`,borderRadius:12,
+        padding:"24px 18px",textAlign:"center"}}>
+        <div style={{fontSize:30,marginBottom:10,opacity:0.5}}>🛠</div>
+        <div style={{fontSize:14,fontWeight:600,color:C.text,marginBottom:6}}>
+          Card content not yet authored
+        </div>
+        <div style={{fontSize:12,color:C.textSub,lineHeight:1.7,maxWidth:300,margin:"0 auto"}}>
+          This alarm is catalogued and searchable. Field-checklist (rule box, ordered steps,
+          expected result, parameter refs) coming as we build it.
+        </div>
+      </div>
+
+      {/* Type / severity meta */}
+      <div style={{display:"flex",gap:10,marginTop:12,fontSize:11,color:C.textSub}}>
+        <div><strong style={{color:C.textSub}}>Family:</strong> <span style={{color:C.fanuc}}>{alarm.type}</span></div>
+        <div><strong style={{color:C.textSub}}>Severity:</strong> <span style={{color:sevColor}}>{alarm.severity}</span></div>
+      </div>
+    </div>
+  );
+}
+
+// ── SCENARIO CARD ────────────────────────────────────────────────
+// Renders authored troubleshooting content when scenario.steps exists,
+// otherwise shows a placeholder for catalogued-but-unauthored scenarios.
+function ScenarioCard({ scenario, onAlarm }) {
+  const authored = Array.isArray(scenario.steps) && scenario.steps.length > 0;
+  const survey   = useAlarmSurvey(`scenario:${scenario.key}`, authored ? scenario.steps : []);
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{background:`linear-gradient(135deg,${C.fanucDim},#0a0a0a)`,
+        border:`1px solid ${C.fanuc}44`,borderRadius:14,padding:"14px 16px",marginBottom:14}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8,flexWrap:"wrap"}}>
+          <span style={{fontSize:11,fontWeight:600,letterSpacing:0.8,textTransform:"uppercase",
+            color:C.fanuc}}>{scenario.category}</span>
+          {!authored && <span style={{marginLeft:"auto"}}><StubBadge /></span>}
+        </div>
+        <div style={{fontSize:18,fontWeight:700,color:C.text,letterSpacing:-0.3,marginBottom:4}}>
+          {scenario.title}
+        </div>
+        <div style={{fontSize:12,color:C.textSub,lineHeight:1.5}}>{scenario.summary}</div>
+      </div>
+
+      {/* Authored content */}
+      {authored ? (
+        <>
+          {/* Context box */}
+          {scenario.context && (
+            <div style={{background:C.orangeDim,border:`1px solid ${C.orange}44`,borderRadius:10,
+              padding:"10px 14px",marginBottom:14,fontSize:13,color:C.orange,lineHeight:1.6}}>
+              {scenario.context}
+            </div>
+          )}
+
+          {/* Procedure checklist */}
+          <AlarmChecklist steps={survey.orderedSteps} total={survey.total} />
+
+          {/* Related alarms — quick links to alarm cards */}
+          {scenario.relatedAlarms && scenario.relatedAlarms.length > 0 && onAlarm && (
+            <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,
+              padding:"10px 14px",marginTop:12}}>
+              <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:0.8,
+                color:C.textSub,marginBottom:8}}>Related alarms</div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                {scenario.relatedAlarms.map(k => {
+                  const a = findAlarmByKey(k);
+                  if (!a) return null;
+                  return (
+                    <button key={k} onClick={() => onAlarm(k)}
+                      style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,
+                        padding:"7px 11px",fontSize:12,color:C.text,cursor:"pointer",
+                        fontFamily:"inherit",display:"flex",alignItems:"center",gap:6}}>
+                      {a.codes.filter(c=>/^\d/.test(c)).slice(0,1).map(c=><Badge key={c} label={c} />)}
+                      <span>{a.title}</span>
+                      <span style={{color:C.fanuc,marginLeft:4}}>›</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Survey */}
+          <AlarmSurvey
+            steps={scenario.steps}
+            counts={survey.counts}
+            onSubmit={survey.submit}
+            submitted={survey.submitted}
+            total={survey.total}
+          />
+        </>
+      ) : (
+        /* Unauthored placeholder */
+        <div style={{background:C.card,border:`1px dashed ${C.border}`,borderRadius:12,
+          padding:"24px 18px",textAlign:"center"}}>
+          <div style={{fontSize:30,marginBottom:10,opacity:0.5}}>🧭</div>
+          <div style={{fontSize:14,fontWeight:600,color:C.text,marginBottom:6}}>
+            Troubleshooting flow not yet authored
+          </div>
+          <div style={{fontSize:12,color:C.textSub,lineHeight:1.7,maxWidth:320,margin:"0 auto"}}>
+            This scenario is catalogued. Decision tree, branched checks, related alarms,
+            and links to interactive tools will be added here.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── AI PHOTO PAGE ────────────────────────────────────────────────
+function PhotoPage({ onResult }) {
+  const [phase,   setPhase]   = useState("idle");
+  const [codes,   setCodes]   = useState([]);
+  const [preview, setPreview] = useState(null);
+  const [errMsg,  setErrMsg]  = useState("");
+  const fileRef = useRef();
+
+  const processImage = async (file) => {
+    setPhase("loading");
+    setPreview(URL.createObjectURL(file));
+    const base64 = await new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload  = () => res(r.result.split(",")[1]);
+      r.onerror = rej;
+      r.readAsDataURL(file);
+    });
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({
+          model:"claude-sonnet-4-20250514", max_tokens:500,
+          messages:[{ role:"user", content:[
+            { type:"image", source:{ type:"base64", media_type: file.type.startsWith("image/") ? file.type : "image/jpeg", data:base64 } },
+            { type:"text",  text:`You are a FANUC CNC alarm code reader. Examine this image of a CNC screen.
+List ALL alarm codes visible. FANUC codes look like: 443, 610, 9059, SV0401, OT0500, PS0100, etc.
+Return ONLY valid JSON with no preamble or markdown: {"codes":["443","610"]}
+If no alarm codes visible: {"codes":[]}` }
+          ]}]
+        })
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error.message);
+      const text = data.content.map(b => b.text||"").join("");
+      let detected = [];
+      try {
+        const clean = text.replace(/```json|```/g,"").trim();
+        detected = JSON.parse(clean).codes || [];
+      } catch {
+        const m = text.match(/\b([A-Z]{0,2}\d{3,4})\b/g);
+        if (m) detected = [...new Set(m)];
+      }
+      setCodes(detected);
+      setPhase(detected.length > 0 ? "found" : "notfound");
+    } catch (e) {
+      setErrMsg(e.message || "Unknown error");
+      setPhase("error");
+    }
+  };
+
+  const reset = () => {
+    setPhase("idle"); setPreview(null); setCodes([]); setErrMsg("");
+    if (fileRef.current) fileRef.current.value = "";
+  };
+
+  return (
+    <div style={{padding:"24px 0"}}>
+      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:4}}>AI Recognition</div>
+      <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:-0.5,marginBottom:16}}>Read Alarm from Photo</div>
+
+      {phase==="idle" && <>
+        <div style={{border:`2px dashed ${C.fanuc}55`,borderRadius:16,padding:"32px 20px",
+          textAlign:"center",background:`${C.fanucDim}22`,cursor:"pointer",marginBottom:12}}
+          onClick={() => fileRef.current?.click()}>
+          <div style={{fontSize:44,marginBottom:12}}>📷</div>
+          <div style={{fontSize:15,fontWeight:700,color:C.fanuc,marginBottom:4}}>Take Photo or Choose Image</div>
+          <div style={{fontSize:12,color:C.textSub}}>Point camera at the CNC alarm screen</div>
+        </div>
+        <input ref={fileRef} type="file" accept="image/*" capture="environment"
+          onChange={e=>{ const f=e.target.files?.[0]; if(f) processImage(f); }}
+          style={{display:"none"}} />
+        <button onClick={()=>fileRef.current?.click()}
+          style={{width:"100%",background:C.fanuc,border:"none",borderRadius:10,
+            padding:"14px",fontSize:15,fontWeight:700,color:C.bg,cursor:"pointer",marginBottom:12}}>
+          Open Camera →
+        </button>
+        <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,
+          padding:"12px 14px",fontSize:12,color:C.textSub,lineHeight:1.8}}>
+          <strong style={{color:C.text}}>Tips for best results</strong><br/>
+          • Fill the frame with the CNC alarm screen<br/>
+          • Ensure alarm codes are clearly visible and in focus<br/>
+          • Works with FANUC 0i / 16i / 18i / 30i displays
+        </div>
+      </>}
+
+      {phase==="loading" && (
+        <div style={{textAlign:"center",padding:"20px 0"}}>
+          {preview && <img src={preview} alt="preview" style={{width:"100%",borderRadius:12,marginBottom:16,objectFit:"cover",maxHeight:220}} />}
+          <div style={{fontSize:14,fontWeight:600,color:C.fanuc,marginBottom:6}}>Reading alarm codes…</div>
+          <div style={{fontSize:12,color:C.textSub,marginBottom:20}}>AI is analysing the CNC screen</div>
+          <div style={{display:"flex",justifyContent:"center",gap:8}}>
+            {[0,1,2].map(i=><div key={i} style={{width:10,height:10,borderRadius:"50%",background:C.fanuc,animation:`blink 1.2s ${i*0.4}s step-start infinite`}} />)}
+          </div>
+        </div>
+      )}
+
+      {phase==="found" && (
+        <div>
+          {preview && <img src={preview} alt="preview" style={{width:"100%",borderRadius:12,marginBottom:14,objectFit:"cover",maxHeight:200}} />}
+          <div style={{background:C.greenDim,border:`1px solid ${C.green}44`,borderRadius:10,
+            padding:"10px 14px",marginBottom:14,fontSize:13,color:C.green}}>
+            ✓ Detected {codes.length} alarm code{codes.length!==1?"s":""}
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12}}>
+            {codes.map((code,i)=>{ const alarm=findAlarmByCode(code); return (
+              <button key={i} onClick={()=>alarm&&onResult(alarm.key)} disabled={!alarm}
+                style={{background:alarm?C.card:C.surface,border:`1.5px solid ${alarm?C.fanuc:C.border}`,
+                  borderRadius:10,padding:"12px 14px",display:"flex",alignItems:"center",gap:12,
+                  cursor:alarm?"pointer":"default",textAlign:"left",width:"100%"}}>
+                <Badge label={code} />
+                <div style={{flex:1}}>
+                  {alarm ? <div style={{fontSize:13,fontWeight:600,color:C.text}}>{alarm.title}</div>
+                         : <div style={{fontSize:12,color:C.textDim}}>Not in database yet</div>}
+                </div>
+                {alarm && <span style={{color:C.fanuc,fontSize:18}}>›</span>}
+              </button>
+            );})}
+          </div>
+          <button onClick={reset} style={{width:"100%",background:C.surface,border:`1px solid ${C.border}`,
+            borderRadius:10,padding:"12px",fontSize:13,color:C.textSub,cursor:"pointer",fontWeight:600}}>
+            Try another photo
+          </button>
+        </div>
+      )}
+
+      {phase==="notfound" && (
+        <div>
+          {preview && <img src={preview} alt="preview" style={{width:"100%",borderRadius:12,marginBottom:14,objectFit:"cover",maxHeight:200}} />}
+          <div style={{background:C.orangeDim,border:`1px solid ${C.orange}44`,borderRadius:10,
+            padding:"12px 14px",marginBottom:14,fontSize:13,color:C.orange,lineHeight:1.6}}>
+            No alarm codes detected. Make sure the alarm screen is visible and the image is in focus.
+          </div>
+          <button onClick={reset} style={{width:"100%",background:C.fanuc,border:"none",
+            borderRadius:10,padding:"14px",fontSize:14,fontWeight:700,color:C.bg,cursor:"pointer"}}>
+            Try again
+          </button>
+        </div>
+      )}
+
+      {phase==="error" && (
+        <div>
+          <div style={{background:C.redDim,border:`1px solid ${C.red}44`,borderRadius:10,
+            padding:"12px 14px",marginBottom:14,fontSize:13,color:C.red,lineHeight:1.6}}>
+            Error: {errMsg}
+          </div>
+          <button onClick={reset} style={{width:"100%",background:C.fanuc,border:"none",
+            borderRadius:10,padding:"14px",fontSize:14,fontWeight:700,color:C.bg,cursor:"pointer"}}>
+            Try again
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── BROWSE PAGE ──────────────────────────────────────────────────
+// Unified Browse row — one design for CNC alarms, amp LED-only alarms, and
+// status errors. The only visual difference between an alarm and an error is
+// the 7-seg faceplate state (ALM red vs ERR yellow), which mirrors the machine.
+const AlarmRow = memo(function AlarmRow({ badges = [], title, desc, segs = [], onClick }) {
+  const shown = segs.slice(0, 3);
+  const extra = segs.length - shown.length;
+  return (
+    <button onClick={onClick}
+      style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,
+        padding:"12px 14px",display:"flex",alignItems:"center",gap:10,
+        cursor:"pointer",textAlign:"left",width:"100%",
+        // Off-screen rows skip layout & paint entirely — long shelves render
+        // like short ones, and this scales as the DB grows.
+        contentVisibility:"auto",containIntrinsicSize:"auto 92px"}}>
+      <div style={{flex:1,minWidth:0}}>
+        {badges.length > 0 && (
+          <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:5}}>
+            {badges.map(c=><Badge key={c} label={c} />)}
+          </div>
+        )}
+        <div style={{fontSize:14,fontWeight:600,color:C.text,marginBottom:3}}>{title}</div>
+        <div style={{fontSize:12,color:C.textSub,lineHeight:1.4}}>{desc}</div>
+      </div>
+      {shown.length > 0 && (
+        <div style={{flexShrink:0,display:"flex",alignItems:"center",gap:5}}>
+          {shown.map((s,i)=>(
+            <SevenSegDisplay key={i} unit={s.unit} code={s.code}
+              kind={s.kind || "alarm"} scale={0.55} showLabel={false} />
+          ))}
+          {extra > 0 && <span style={{fontSize:10,fontWeight:700,color:C.textDim}}>+{extra}</span>}
+        </div>
+      )}
+      <span style={{color:C.textDim,fontSize:18,flexShrink:0}}>›</span>
+    </button>
+  );
+});
+
+// ── CATEGORY ICONS ───────────────────────────────────────────────
+// One design language: 24×24 stroke icons, round caps, no fills except
+// tiny hubs. Each is drawn for its word — bolt (power), rotating chuck
+// (spindle), motor gear (servo), CPU chip (control), ladder rungs (PMC).
+// Colour comes from the category accent so icon + tile always match.
+function CatIcon({ type, col, size = 24 }) {
+  const S = { fill:"none", stroke:col, strokeWidth:1.8, strokeLinecap:"round", strokeLinejoin:"round" };
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true">
+      {type === "PS" && ( /* lightning bolt — power in, power out */
+        <path {...S} d="M13 2 L5.5 13 H11 L9.5 22 L18.5 9.5 H12.5 Z" />
+      )}
+      {type === "SP" && ( /* spindle — milling tool: taper holder, shank, fluted end mill */
+        <g>
+          <path {...S} d="M7.5 2.5 H16.5 L14.8 6.5 H9.2 Z" />
+          <path {...S} d="M9.2 6.5 H14.8 V19.5 H9.2 Z" />
+          <line {...S} x1="9.2" y1="19.5" x2="14.8" y2="14.6" />
+          <line {...S} x1="9.2" y1="16.2" x2="14.8" y2="11.3" />
+          <line {...S} x1="6.2" y1="21.5" x2="17.8" y2="21.5" />
+        </g>
+      )}
+      {type === "SVM" && ( /* servo motor gear — 8 teeth + shaft hub */
+        <g>
+          <circle {...S} cx="12" cy="12" r="5.2" />
+          <circle cx="12" cy="12" r="1.6" fill={col} stroke="none" />
+          {[0,45,90,135,180,225,270,315].map(a => {
+            const r = a * Math.PI / 180;
+            const x1 = 12 + Math.cos(r) * 5.2, y1 = 12 + Math.sin(r) * 5.2;
+            const x2 = 12 + Math.cos(r) * 8.2, y2 = 12 + Math.sin(r) * 8.2;
+            return <line key={a} {...S} x1={x1} y1={y1} x2={x2} y2={y2} />;
+          })}
+        </g>
+      )}
+      {type === "NC" && ( /* CNC control — CPU chip, corner pins so it doesn't read as a cross */
+        <g>
+          <rect {...S} x="6.5" y="6.5" width="11" height="11" rx="2.2" />
+          <rect {...S} x="10.2" y="10.2" width="3.6" height="3.6" rx="0.9" />
+          {[9.3,14.7].map(p => (
+            <g key={p}>
+              <line {...S} x1={p} y1="6.5"  x2={p} y2="3.5" />
+              <line {...S} x1={p} y1="17.5" x2={p} y2="20.5" />
+              <line {...S} x1="6.5"  y1={p} x2="3.5"  y2={p} />
+              <line {...S} x1="17.5" y1={p} x2="20.5" y2={p} />
+            </g>
+          ))}
+        </g>
+      )}
+      {type === "PMC" && ( /* ladder logic — rails, rungs, contact pair */
+        <g>
+          <line {...S} x1="6"  y1="3" x2="6"  y2="21" />
+          <line {...S} x1="18" y1="3" x2="18" y2="21" />
+          <line {...S} x1="6" y1="8"  x2="10.6" y2="8" />
+          <line {...S} x1="13.4" y1="8" x2="18" y2="8" />
+          <line {...S} x1="10.6" y1="6.4" x2="10.6" y2="9.6" />
+          <line {...S} x1="13.4" y1="6.4" x2="13.4" y2="9.6" />
+          <line {...S} x1="6" y1="16" x2="9.8" y2="16" />
+          <line {...S} x1="14.2" y1="16" x2="18" y2="16" />
+          <circle {...S} cx="12" cy="16" r="2.2" />
+        </g>
+      )}
+    </svg>
+  );
+}
+
+// ── BROWSE SHELF CACHE ───────────────────────────────────────────
+// The shelf contents never change at runtime, so each category's list
+// (CNC entries + amp LED-only entries + status errors) is built exactly
+// once, on first open, and reused forever. With the O(1) code indexes
+// above, even the first build is instant.
+const _shelfCache = {};
+function getBrowseShelf(c) {
+  if (_shelfCache[c]) return _shelfCache[c];
+  const cncEntries = ALARM_DB.filter(a => alarmCategory(a) === c);
+  // Amp LED-only entries (no CNC card) that belong to this shelf
+  let ampEntries = [];
+  if (c === "PS")  ampEntries = PSM_ALARM_DB.map(e => ({ unit:"PSM", entry:e }));
+  if (c === "SVM") ampEntries = SVM_ALARM_DB.map(e => ({ unit:"SVM", entry:e }));
+  if (c === "SP")  ampEntries = SPM_ALARM_DB.map(e => ({ unit:"SPM", entry:e }));
+  // Only show amp entries that don't already have a full CNC card.
+  ampEntries = ampEntries.filter(a => {
+    // PSM/SVM entries carry an explicit cnc-> number.
+    if (a.entry.cnc) {
+      const cncNum = a.entry.cnc.split("/")[0].trim();
+      return !findAlarmByCode(cncNum);
+    }
+    // SPM LED "NN" == spindle CNC alarm SP90NN — hide if that card exists,
+    // so SP9001 and SPM 01 don't both appear as separate rows.
+    if (a.unit === "SPM") {
+      const pair = combinedBySp(a.entry.code);
+      if (pair && findAlarmByKey(pair.spKey)) return false;
+      if (/^\d{2}$/.test(a.entry.code)) return !findAlarmByCode("90" + a.entry.code);
+    }
+    return true;
+  });
+  // Pre-warm the xref cache so row segs render from cache on first paint.
+  cncEntries.forEach(a => ampXrefForCodes(a.codes, a.type));
+  const shelf = { cncEntries, ampEntries, errEntries: c === "SP" ? SPM_ERROR_DB : [] };
+  _shelfCache[c] = shelf;
+  return shelf;
+}
+
+function BrowsePage({ onAlarm, cat = null, onCat, onBack }) {
+  // Category selection is lifted to App so drilling into a unit counts
+  // as a real navigation step the global Back button can pop.
+
+  // Category definitions: label + accent colour (icon drawn by CatIcon)
+  const CATS = [
+    { key:"PS",  label:"Power Supply",  col:C.fanuc },
+    { key:"SP",  label:"Spindle",       col:C.blue },
+    { key:"SVM", label:"Servo",         col:C.red },
+    { key:"NC",  label:"NC / Control",  col:C.green },
+    { key:"PMC", label:"PMC / Ladder",  col:"#c084fc" },
+  ];
+
+  // Shelf lists come from the module-level cache — computed once per
+  // category for the whole session, since the DBs are static.
+  const buildList = getBrowseShelf;
+
+  // ── Category chooser ──
+  if (!cat) {
+    const counts = {};
+    CATS.forEach(c => {
+      const { cncEntries, ampEntries, errEntries } = buildList(c.key);
+      counts[c.key] = cncEntries.length + ampEntries.length + errEntries.length;
+    });
+    return (
+      <div style={{padding:"24px 0"}}>
+        <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:6}}>Alarm Library</div>
+        <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:-0.5,marginBottom:6}}>Browse by unit</div>
+        <div style={{fontSize:13,color:C.textSub,lineHeight:1.5,marginBottom:20}}>Pick where the alarm is showing.</div>
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {CATS.map(c => (
+            <button key={c.key} onClick={()=>onCat(c.key)}
+              style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,
+                padding:"16px 16px",display:"flex",alignItems:"center",gap:14,
+                cursor:"pointer",textAlign:"left",width:"100%"}}>
+              <div style={{width:46,height:46,borderRadius:12,flexShrink:0,
+                background:`${c.col}1a`,border:`1px solid ${c.col}44`,
+                display:"flex",alignItems:"center",justifyContent:"center"}}>
+                <CatIcon type={c.key} col={c.col} size={26} />
+              </div>
+              <div style={{flex:1}}>
+                <div style={{fontSize:16,fontWeight:700,color:C.text}}>{c.label}</div>
+              </div>
+              <div style={{textAlign:"right",flexShrink:0}}>
+                <div style={{fontSize:18,fontWeight:700,color:c.col}}>{counts[c.key]}</div>
+                <div style={{fontSize:10,color:C.textDim}}>alarms</div>
+              </div>
+            </button>
+          ))}
+        </div>
+        <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,
+          padding:"12px 14px",marginTop:16,fontSize:12,color:C.textSub,lineHeight:1.6}}>
+          Looking for a specific code? Use <strong style={{color:C.fanuc}}>Search</strong> to jump straight to it.
+        </div>
+      </div>
+    );
+  }
+
+  // ── Category detail (alarm list) ──
+  const catDef = CATS.find(c => c.key === cat);
+  const { cncEntries, ampEntries, errEntries } = buildList(cat);
+
+  return (
+    <div style={{padding:"24px 0"}}>
+      <button onClick={onBack}
+        style={{background:"transparent",border:"none",color:C.fanuc,fontSize:13,
+          fontWeight:600,cursor:"pointer",padding:0,marginBottom:14,display:"flex",alignItems:"center",gap:6}}>
+        ‹ All units
+      </button>
+      <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:18}}>
+        <div style={{width:40,height:40,borderRadius:11,flexShrink:0,
+          background:`${catDef.col}1a`,border:`1px solid ${catDef.col}44`,
+          display:"flex",alignItems:"center",justifyContent:"center"}}>
+          <CatIcon type={catDef.key} col={catDef.col} size={22} />
+        </div>
+        <div style={{fontSize:20,fontWeight:700,color:C.text,letterSpacing:-0.4}}>{catDef.label}</div>
+      </div>
+
+      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+        {cncEntries.map(a=>(
+          <AlarmRow key={a.key} onClick={()=>onAlarm(a.key)}
+            badges={a.codes.filter(c=>/^[A-Za-z]*\d/.test(c)).slice(0,4)}
+            title={a.title} desc={a.desc}
+            segs={ampXrefForCodes(a.codes, a.type).filter(s=>!s.dash)
+                    .map(s=>({unit:s.unit, code:s.code, kind:"alarm"}))} />
+        ))}
+
+        {/* Amp LED-only entries for this shelf — same card style as CNC rows */}
+        {ampEntries.map((r,i)=>(
+          <AlarmRow key={"amp"+i} onClick={()=>onAlarm("amp:"+r.unit+":"+r.entry.code)}
+            badges={/^\d{2}$/.test(r.entry.code) && r.unit==="SPM" ? ["SP9"+r.entry.code] : []}
+            title={r.entry.title}
+            desc={r.entry.desc.slice(0,90)+(r.entry.desc.length>90?"…":"")}
+            segs={[{unit:r.unit, code:r.entry.code, kind:"alarm"}]} />
+        ))}
+
+        {/* Spindle STATUS errors (ERR LED) — same card design, ERR 7-seg state */}
+        {errEntries.length > 0 && (
+          <>
+            <div style={{display:"flex",alignItems:"center",gap:8,margin:"14px 2px 2px"}}>
+              <div style={{height:1,flex:1,background:C.border}} />
+              <span style={{fontSize:10,fontWeight:800,letterSpacing:1,color:C.orange,textTransform:"uppercase"}}>
+                Status Errors · ERR LED
+              </span>
+              <div style={{height:1,flex:1,background:C.border}} />
+            </div>
+            {errEntries.map((e,i)=>(
+              <AlarmRow key={"err"+i} onClick={()=>onAlarm("err:SPM:"+e.code)}
+                title={e.title}
+                desc={e.desc.slice(0,90)+(e.desc.length>90?"…":"")}
+                segs={[{unit:"SPM", code:e.code, kind:"error"}]} />
+            ))}
+          </>
+        )}
+
+        {cncEntries.length===0 && ampEntries.length===0 && errEntries.length===0 && (
+          <div style={{textAlign:"center",padding:"32px 16px",color:C.textDim,fontSize:13,lineHeight:1.6}}>
+            No alarms in this category yet.<br/>More are added regularly.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── HISTORY PAGE ─────────────────────────────────────────────────
+function HistoryPage({ history, onAlarm }) {
+  if (history.length===0) return (
+    <div style={{padding:"24px 0",textAlign:"center",paddingTop:48}}>
+      <div style={{fontSize:44,marginBottom:16}}>📋</div>
+      <div style={{fontSize:16,fontWeight:700,color:C.text,marginBottom:8}}>No history yet</div>
+      <div style={{fontSize:13,color:C.textSub,lineHeight:1.6,maxWidth:260,margin:"0 auto"}}>
+        Alarm guides you open will appear here for quick access next time.
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{padding:"24px 0"}}>
+      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:6}}>Recent</div>
+      <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:-0.5,marginBottom:16}}>Alarm History</div>
+      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+        {history.map((a,i)=>(
+          <button key={i} onClick={()=>onAlarm(a.key)}
+            style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,
+              padding:"12px 14px",display:"flex",alignItems:"center",gap:12,
+              cursor:"pointer",textAlign:"left",width:"100%"}}>
+            <div style={{flex:1}}>
+              <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:5}}>
+                {a.codes.filter(c=>/^\d/.test(c)).slice(0,4).map(c=><Badge key={c} label={c} />)}
+              </div>
+              <div style={{fontSize:14,fontWeight:600,color:C.text,marginBottom:2}}>{a.title}</div>
+              <div style={{fontSize:12,color:C.textSub}}>{a.desc}</div>
+            </div>
+            <span style={{color:C.textDim,fontSize:18,flexShrink:0}}>›</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── GUIDES PAGE — TROUBLESHOOTING SCENARIOS ─────────────────────
+// Problem-based menu: "Motor doesn't turn", "Vibrates when not cutting", etc.
+// Grouped by category, searchable. Each entry opens a ScenarioCard.
+function GuidesPage({ onScenario }) {
+  const [query,    setQuery]    = useState("");
+  const [activeCat, setActiveCat] = useState("All");
+
+  const filtered = TROUBLESHOOTING_DB.filter(s => {
+    const q = query.trim().toLowerCase();
+    const matchQuery = q === "" ||
+      s.title.toLowerCase().includes(q) ||
+      s.summary.toLowerCase().includes(q) ||
+      s.category.toLowerCase().includes(q);
+    const matchCat = activeCat === "All" || s.category === activeCat;
+    return matchQuery && matchCat;
+  });
+
+  const grouped = TS_CATEGORIES.reduce((acc, cat) => {
+    const items = filtered.filter(s => s.category === cat);
+    if (items.length) acc[cat] = items;
+    return acc;
+  }, {});
+
+  return (
+    <div style={{padding:"24px 0"}}>
+      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:6}}>
+        Troubleshooting
+      </div>
+      <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:-0.5,marginBottom:6}}>
+        Problem-Based Guides
+      </div>
+      <div style={{fontSize:13,color:C.textSub,lineHeight:1.55,marginBottom:14}}>
+        Use this when there's <em>no alarm code</em> — or the symptom doesn't match what the alarm says.
+        Pick the closest description.
+      </div>
+
+      <input value={query} onChange={e=>setQuery(e.target.value)}
+        placeholder="Search symptom or keyword…"
+        style={{width:"100%",background:C.surface,border:`1.5px solid ${C.border}`,
+          borderRadius:10,padding:"12px 14px",fontSize:14,color:C.text,outline:"none",
+          fontFamily:"monospace",marginBottom:12}} />
+
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:14}}>
+        {["All", ...TS_CATEGORIES].map(cat => (
+          <button key={cat} onClick={() => setActiveCat(cat)}
+            style={{padding:"6px 11px",borderRadius:8,fontSize:11,fontWeight:600,cursor:"pointer",
+              background: activeCat===cat ? C.fanucDim : C.card,
+              color:      activeCat===cat ? C.fanuc : C.textSub,
+              border:`1px solid ${activeCat===cat ? C.fanuc+"55" : C.border}`}}>
+            {cat}
+          </button>
+        ))}
+      </div>
+
+      {Object.keys(grouped).length === 0 ? (
+        <div style={{textAlign:"center",padding:"32px 16px",color:C.textDim,fontSize:13}}>
+          No scenarios match "{query}"
+        </div>
+      ) : Object.entries(grouped).map(([cat, items]) => (
+        <div key={cat} style={{marginBottom:18}}>
+          <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,
+            color:C.fanuc,marginBottom:8}}>
+            {cat} <span style={{color:C.textDim,fontWeight:500}}>({items.length})</span>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {items.map(s => (
+              <button key={s.key} onClick={() => onScenario(s.key)}
+                style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,
+                  padding:"11px 13px",display:"flex",alignItems:"flex-start",gap:11,
+                  cursor:"pointer",textAlign:"left",width:"100%"}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:13,fontWeight:600,color:C.text,marginBottom:3,
+                    display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                    <span>{s.title}</span>
+                    {(!Array.isArray(s.steps) || s.steps.length === 0) && <StubBadge />}
+                  </div>
+                  <div style={{fontSize:12,color:C.textSub,lineHeight:1.45}}>{s.summary}</div>
+                </div>
+                <span style={{color:C.textDim,fontSize:18,flexShrink:0,marginTop:2}}>›</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
+
+      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,
+        padding:"12px 14px",marginTop:14,fontSize:12,color:C.textSub,lineHeight:1.6}}>
+        <strong style={{color:C.textSub}}>{TROUBLESHOOTING_DB.length} scenarios</strong> · catalogued
+      </div>
+    </div>
+  );
+}
+
+// ── HOME PAGE ────────────────────────────────────────────────────
+function HomePage({ onPhoto, onManual, onAlarm, history }) {
+  return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+      <div style={{background:`linear-gradient(160deg,#1a1600 0%,${C.bg} 60%)`,
+        borderBottom:`1px solid ${C.border}`,padding:"28px 20px 24px"}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
+          <div style={{width:38,height:38,borderRadius:10,background:C.fanuc,display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <span style={{fontSize:18}}>⚙</span>
+          </div>
+          <div>
+            <div style={{fontSize:13,fontWeight:700,letterSpacing:1,color:C.fanuc}}>FanuXpert</div>
+          </div>
+        </div>
+        <div style={{fontSize:26,fontWeight:800,color:C.text,letterSpacing:-0.8,lineHeight:1.2,marginBottom:8}}>Alarm on the machine?</div>
+        <div style={{fontSize:14,color:C.textSub,lineHeight:1.6}}>Photograph the screen or enter the alarm code manually.</div>
+      </div>
+
+      <div style={{flex:1,overflowY:"auto",padding:"20px 16px",display:"flex",flexDirection:"column",gap:12}}>
+        {/* Primary field action — type the alarm code right here, no extra tap. */}
+        <AlarmSearch onResult={onAlarm} showHeading={false} />
+
+        <button onClick={onPhoto} style={{background:`linear-gradient(135deg,${C.fanucDim},#1a1200)`,
+          border:`2px solid ${C.fanuc}`,borderRadius:16,padding:"20px 18px",
+          display:"flex",alignItems:"center",gap:14,cursor:"pointer",textAlign:"left",width:"100%"}}>
+          <div style={{width:48,height:48,borderRadius:12,background:C.fanuc,
+            display:"flex",alignItems:"center",justifyContent:"center",fontSize:24,flexShrink:0}}>📷</div>
+          <div>
+            <div style={{fontSize:16,fontWeight:700,color:C.fanuc,marginBottom:3}}>Photograph the screen</div>
+            <div style={{fontSize:12,color:C.textSub,lineHeight:1.4}}>Can't type the code? Let AI read it from a photo</div>
+          </div>
+        </button>
+
+        <div style={{marginTop:4}}>
+          <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:10}}>Quick Access</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            {[
+              { icon:"📊", label:"STATUS Display",  sub:"LED state reference",       key:"status" },
+              { icon:"🔢", label:"DGN 358 Decoder", sub:"SV0401 diagnostic tool",    key:"dgn" },
+              { icon:"🔴", label:"7-Seg Lookup",    sub:"PSM / SVM / SPM codes",     key:"amp" },
+              { icon:"📋", label:"Alarm History",   sub:"Recently opened guides",     key:"history" },
+              { icon:"📚", label:"All Alarms",      sub:"Search & browse database",  key:"browse" },
+            ].map(item=>(
+              <button key={item.key} onClick={()=>onAlarm(item.key)}
+                style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,
+                  padding:"12px 12px",cursor:"pointer",textAlign:"left"}}>
+                <div style={{fontSize:22,marginBottom:6}}>{item.icon}</div>
+                <div style={{fontSize:13,fontWeight:600,color:C.text,marginBottom:2}}>{item.label}</div>
+                <div style={{fontSize:11,color:C.textSub}}>{item.sub}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div style={{marginTop:4}}>
+          <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:10}}>Recently Viewed</div>
+          {history.length===0 ? (
+            <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,
+              padding:"16px 14px",textAlign:"center",fontSize:13,color:C.textDim}}>
+              No history yet — open an alarm guide to start
+            </div>
+          ) : history.slice(0,3).map((a,i)=>(
+            <button key={i} onClick={()=>onAlarm(a.key)}
+              style={{width:"100%",background:C.card,border:`1px solid ${C.border}`,borderRadius:10,
+                padding:"11px 14px",display:"flex",alignItems:"center",gap:12,
+                cursor:"pointer",marginBottom:6,textAlign:"left"}}>
+              <div style={{flex:1}}>
+                <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:5}}>
+                  {a.codes.filter(c=>/^\d/.test(c)).slice(0,4).map(c=><Badge key={c} label={c} />)}
+                </div>
+                <div style={{fontSize:13,fontWeight:500,color:C.text}}>{a.title}</div>
+              </div>
+              <span style={{color:C.textDim,fontSize:18}}>›</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── MANUAL ENTRY PAGE ────────────────────────────────────────────
+function AlarmSearch({ onResult, showHeading = true }) {
+  const [code,  setCode]  = useState("");
+  const [ampResults, setAmpResults] = useState([]);
+
+  const unitCol = { PSM: C.fanuc, SVM: C.red, SPM: C.blue };
+  const unitDim = { PSM: C.fanucDim, SVM: C.redDim, SPM: C.blueDim };
+
+  // Collapse a combined PS+SP fault (one physical converter fault seen on two
+  // faceplates) into a single row that carries both 7-seg codes and routes to
+  // the full card for whichever side the tech searched.
+  const buildDisplayRows = (amps) => {
+    const rows = [], seenPairs = new Set();
+    amps.forEach(r => {
+      let pair = null, side = null;
+      if (r.kind === "alarm" && r.unit === "SPM") { pair = combinedBySp(r.entry.code); side = "sp"; }
+      if (r.kind === "alarm" && r.unit === "PSM") { pair = combinedByPs(r.entry.code); side = "ps"; }
+      if (pair) {
+        if (seenPairs.has(pair.spKey)) return;
+        seenPairs.add(pair.spKey);
+        rows.push({
+          combined: true,
+          psEntry: PSM_ALARM_DB.find(x => x.code === pair.ps),
+          spEntry: SPM_ALARM_DB.find(x => x.code === pair.sp),
+          targetKey: side === "ps" ? pair.psKey : pair.spKey,
+        });
+      } else {
+        rows.push({ combined: false, ...r });
+      }
+    });
+    return rows;
+  };
+
+  const search = () => {
+    if (!code.trim()) return;
+    setAmpResults([]);
+    const amps = findAmpAlarms(code);
+    const hasError = amps.some(a => a.kind === "error");
+    const cardMatches = findAllAlarmsByCode(code);
+    const alarm = cardMatches[0] || null;
+    const rows = buildDisplayRows(amps);
+    const hasCombined = rows.some(r => r.combined);
+
+    // One code, more than one alarm card (e.g. "32" → spindle SP9032 AND PMC
+    // ER32). Don't guess — show every card, plus the spindle status-error row
+    // if the same number is also an ERR LED code, and let the tech choose.
+    if (cardMatches.length > 1) {
+      const cardRows  = cardMatches.map(a => ({ kind: "card", card: a }));
+      const errorRows = rows.filter(r => r.kind === "error");
+      setAmpResults([...cardRows, ...errorRows]);
+      return;
+    }
+
+    // Direct CNC hit — but not when a spindle ALM/ERR ambiguity exists,
+    // so the tech can pick the reading that matches the lit LED.
+    if (alarm && !hasError) { onResult(alarm.key); return; }
+    // A single plain amp result with a full card → go straight there.
+    // Combined faults never auto-route — we show both faceplates first.
+    if (!alarm && rows.length === 1 && !hasCombined) {
+      const r = amps[0];
+      if (r.kind === "error") return onResult("err:SPM:" + r.entry.code);
+      if (r.cncAlarm) return onResult(r.cncAlarm.key);
+      return onResult("amp:" + r.unit + ":" + r.entry.code);
+    }
+    if (rows.length > 0) { setAmpResults(rows); return; }
+    if (alarm) { onResult(alarm.key); return; }
+    onResult("notfound");
+  };
+
+  return (
+    <div>
+      {showHeading && (<>
+        <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:6}}>Manual Entry</div>
+        <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:-0.5,marginBottom:20}}>Enter Alarm Code</div>
+      </>)}
+      <div style={{marginBottom:20}}>
+        <div style={{fontSize:11,color:C.textSub,marginBottom:8}}>Alarm code (CNC number or amplifier LED code)</div>
+        <input value={code} onChange={e=>{setCode(e.target.value);setAmpResults([]);}}
+          onKeyDown={e=>e.key==="Enter"&&search()}
+          placeholder="e.g.  443  SV0417  PS2  12"
+          style={{width:"100%",background:C.surface,border:`1.5px solid ${C.border}`,
+            borderRadius:10,padding:"14px 16px",fontSize:20,fontFamily:"monospace",
+            color:C.fanuc,outline:"none",letterSpacing:1}} />
+      </div>
+      <button onClick={search}
+        style={{width:"100%",background:C.fanuc,border:"none",borderRadius:10,
+          padding:"14px",fontSize:15,fontWeight:700,color:C.bg,cursor:"pointer",marginBottom:16}}>
+        Find Alarm →
+      </button>
+
+      {/* Amp alarm picker — shown when search matches amplifier LED codes.
+          A combined PS+SP fault renders as one row showing BOTH faceplates
+          (e.g. PS "1" + SP "30") so the tech sees what's actually lit. */}
+      {ampResults.length > 0 && (
+        <div style={{marginBottom:16}}>
+          {(() => {
+            const hasCards = ampResults.some(r => r.kind === "card");
+            if (hasCards) {
+              return (
+                <div style={{fontSize:12,fontWeight:600,color:C.text,marginBottom:8,lineHeight:1.5}}>
+                  Code <span style={{color:C.fanuc,fontFamily:"monospace"}}>"{code}"</span> matches more than one alarm — which one are you looking at?
+                </div>
+              );
+            }
+            const anyCombined = ampResults.some(r => r.combined);
+            const plain = ampResults.filter(r => !r.combined);
+            const units = [...new Set(plain.map(r => r.unit))];
+            const mixed = plain.some(r=>r.kind==="error") && plain.some(r=>r.kind!=="error");
+            return (
+              <div style={{fontSize:12,fontWeight:600,color:C.text,marginBottom:8,lineHeight:1.5}}>
+                {anyCombined
+                  ? <>Code <span style={{color:C.fanuc,fontFamily:"monospace"}}>"{code}"</span> is a converter fault — it lights two displays at once:</>
+                  : mixed
+                  ? <>Code <span style={{color:C.fanuc,fontFamily:"monospace"}}>"{code}"</span> — is the <span style={{color:C.red}}>ALM</span> or the <span style={{color:C.orange}}>ERR</span> LED lit on the unit?</>
+                  : units.length > 1
+                  ? <>Code <span style={{color:C.fanuc,fontFamily:"monospace"}}>"{code}"</span> shows on different units — which one are you reading?</>
+                  : <>Code <span style={{color:C.fanuc,fontFamily:"monospace"}}>"{code}"</span> on the {units[0]}:</>}
+              </div>
+            );
+          })()}
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {ampResults.map((r,i) => {
+              // ── Multi-card choice (e.g. spindle SP9032 vs PMC ER32) ──
+              if (r.kind === "card") {
+                const a = r.card;
+                const typeCol = { SP:C.blue, PMC:C.orange, SV:C.red, PS:C.fanuc,
+                                  OT:C.green, OH:C.green, NC:C.textSub }[a.type] || C.textSub;
+                const label = (a.codes.find(c => /[A-Za-z]/.test(c)) || a.codes[0] || "").toUpperCase();
+                return (
+                  <button key={i} onClick={()=>onResult(a.key)}
+                    style={{background:`${typeCol}18`, border:`1px solid ${typeCol}55`,
+                      borderRadius:10, padding:"12px 14px", display:"flex", alignItems:"center", gap:12,
+                      cursor:"pointer", textAlign:"left", width:"100%"}}>
+                    <div style={{minWidth:52, textAlign:"center"}}>
+                      <div style={{fontSize:9,fontWeight:800,letterSpacing:0.5,color:typeCol}}>{a.type}</div>
+                      <div style={{fontSize:13,fontWeight:700,fontFamily:"monospace",color:C.text}}>{label}</div>
+                    </div>
+                    <div style={{flex:1, minWidth:0}}>
+                      <div style={{fontSize:13,fontWeight:600,color:C.text,marginBottom:2}}>{a.title}</div>
+                      <div style={{fontSize:11,color:C.textSub,lineHeight:1.4}}>
+                        {(a.desc||"").slice(0,90)}{(a.desc||"").length>90?"…":""}
+                      </div>
+                    </div>
+                    <span style={{color:typeCol,fontSize:18}}>›</span>
+                  </button>
+                );
+              }
+              // ── Combined PS+SP fault: one row, both faceplates ──
+              if (r.combined) {
+                const title = (r.psEntry && r.psEntry.title) || (r.spEntry && r.spEntry.title) || "Converter fault";
+                return (
+                  <button key={i} onClick={()=>onResult(r.targetKey)}
+                    style={{background:C.fanucDim, border:`1px solid ${C.fanuc}`,
+                      borderRadius:10, padding:"12px 14px", display:"flex", alignItems:"center", gap:12,
+                      cursor:"pointer", textAlign:"left", width:"100%"}}>
+                    <div style={{display:"flex", alignItems:"center", gap:6}}>
+                      <SevenSegDisplay unit="PSM" code={r.psEntry.code} scale={0.62} />
+                      <span style={{color:C.textSub, fontSize:13, fontWeight:700}}>+</span>
+                      <SevenSegDisplay unit="SPM" code={r.spEntry.code} scale={0.62} />
+                    </div>
+                    <div style={{flex:1, minWidth:0}}>
+                      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:2,flexWrap:"wrap"}}>
+                        <span style={{fontSize:9,fontWeight:800,letterSpacing:0.5,padding:"1px 5px",
+                          borderRadius:4,background:`${C.fanuc}22`,color:C.fanuc}}>PS + SP</span>
+                        <span style={{fontSize:13,fontWeight:600,color:C.text}}>{title}</span>
+                      </div>
+                      <div style={{fontSize:11,color:C.textSub,lineHeight:1.4}}>
+                        PS shows <strong style={{color:C.fanuc}}>{r.psEntry.code}</strong>, spindle shows <strong style={{color:C.blue}}>{r.spEntry.code}</strong> — same converter fault.
+                      </div>
+                    </div>
+                    <span style={{color:C.fanuc,fontSize:18}}>›</span>
+                  </button>
+                );
+              }
+              // ── Plain single-unit result ──
+              const isError = r.kind === "error";
+              const accent  = isError ? C.orange : unitCol[r.unit];
+              const cncPrefix = r.unit === "SPM" ? "SP9" : "SV0";
+              const open = () => {
+                if (isError) return onResult("err:SPM:" + r.entry.code);
+                if (r.cncAlarm) return onResult(r.cncAlarm.key);
+                return onResult("amp:" + r.unit + ":" + r.entry.code);
+              };
+              return (
+                <button key={i} onClick={open}
+                  style={{background: isError ? C.orangeDim : unitDim[r.unit],
+                    border:`1px solid ${accent}44`,
+                    borderRadius:10, padding:"12px 14px", display:"flex", alignItems:"center", gap:12,
+                    cursor:"pointer", textAlign:"left", width:"100%"}}>
+                  <SevenSegDisplay unit={r.unit} code={r.entry.code} kind={r.kind} scale={0.62} />
+                  <div style={{flex:1}}>
+                    <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:2,flexWrap:"wrap"}}>
+                      <span style={{fontSize:9,fontWeight:800,letterSpacing:0.5,padding:"1px 5px",
+                        borderRadius:4,background:`${accent}22`,color:accent}}>
+                        {isError ? "ERR" : "ALM"}
+                      </span>
+                      <span style={{fontSize:13,fontWeight:600,color:C.text}}>
+                        {isError ? "SP error" : r.unit} — {r.entry.title}
+                      </span>
+                    </div>
+                    <div style={{fontSize:11,color:C.textSub,lineHeight:1.4}}>
+                      {r.entry.desc.slice(0,90)}{r.entry.desc.length>90?"…":""}
+                    </div>
+                    {!isError && r.entry.cnc && (
+                      <div style={{fontSize:10,color:accent,marginTop:3}}>
+                        CNC alarm: {cncPrefix}{r.entry.cnc.split("/")[0].trim()}
+                      </div>
+                    )}
+                  </div>
+                  <span style={{color:accent,fontSize:18}}>›</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Search tab wrapper — same search UI, with its page heading.
+function ManualEntryPage({ onResult }) {
+  return (
+    <div style={{padding:"24px 0"}}>
+      <AlarmSearch onResult={onResult} showHeading={true} />
+    </div>
+  );
+}
+
+// ── MAIN APP ──────────────────────────────────────────────────────
+export default function App() {
+  const [screen,    setScreen]    = useState("home");
+  const [alarm,     setAlarm]     = useState(null);
+  const [scenario,  setScenario]  = useState(null);
+  const [history,   setHistory]   = useState([]);
+
+  // ── Navigation back-stack ───────────────────────────────────────
+  // Every forward move pushes the CURRENT full view onto the stack.
+  // Back pops exactly one entry and restores it — so "back" always
+  // returns to wherever you actually came from, not a guessed parent.
+  const [browseCat, setBrowseCat] = useState(null); // lifted from BrowsePage so a category counts as a step
+  const [navStack,  setNavStack]  = useState([]);
+
+  const sameView = (a, b) =>
+    a.screen === b.screen && a.alarm === b.alarm &&
+    a.scenario === b.scenario && a.browseCat === b.browseCat;
+
+  // Apply a view. Home is the root: landing on it clears the stack.
+  const go = (next) => {
+    const target = {
+      screen:    next.screen ?? "home",
+      alarm:     "alarm"     in next ? next.alarm     : null,
+      scenario:  "scenario"  in next ? next.scenario  : null,
+      browseCat: "browseCat" in next ? next.browseCat : null,
+    };
+    const current = { screen, alarm, scenario, browseCat };
+    if (sameView(target, current)) return; // no dead "back does nothing" steps
+
+    if (target.screen === "home") {
+      setNavStack([]);
+    } else {
+      setNavStack(s => [...s, current]);
+    }
+    setScreen(target.screen);
+    setAlarm(target.alarm);
+    setScenario(target.scenario);
+    setBrowseCat(target.browseCat);
+  };
+
+  const nav = (s) => go({ screen: s });
+
+  const goBack = () => {
+    if (navStack.length === 0) {
+      setScreen("home"); setAlarm(null); setScenario(null); setBrowseCat(null);
+      return;
+    }
+    const prev = navStack[navStack.length - 1];
+    setNavStack(navStack.slice(0, -1));
+    setScreen(prev.screen);
+    setAlarm(prev.alarm);
+    setScenario(prev.scenario);
+    setBrowseCat(prev.browseCat);
+  };
+
+  const goAlarm = (key) => {
+    if (key==="history") return go({ screen:"history" });
+    if (key==="browse")  return go({ screen:"browse"  });
+    if (key==="guides")  return go({ screen:"guides"  });
+    if (key==="amp")     return go({ screen:"amp"     });
+    if (["status","dgn"].includes(key)) return go({ screen:"alarm", alarm:key });
+    const entry = ALARM_DB.find(a=>a.key===key);
+    if (entry) setHistory(h=>[entry,...h.filter(i=>i.key!==key)].slice(0,10));
+    go({ screen:"alarm", alarm:key });
+  };
+
+  const goScenario = (key) => go({ screen:"scenario", scenario:key });
+
+  // Phone hardware Back button → act like the in-app back arrow.
+  // We keep one "armed" history entry; each hardware Back pops our own nav
+  // stack and immediately re-arms, so Back walks the app instead of leaving it.
+  const goBackRef   = useRef(goBack);   goBackRef.current   = goBack;
+  const canGoBackRef = useRef(false);   canGoBackRef.current = (screen !== "home" || navStack.length > 0);
+  useEffect(() => {
+    window.history.pushState(null, "");            // arm
+    const onPop = () => {
+      if (canGoBackRef.current) goBackRef.current();
+      window.history.pushState(null, "");          // re-arm so Back stays inside the app
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  const titles = {
+    home:"FanuXpert", photo:"Photo Mode", manual:"Manual Entry",
+    status:"STATUS Reference", dgn:"DGN 358 Decoder",
+    browse:"All Alarms", history:"Alarm History",
+    guides:"Troubleshooting", scenario:"Guide",
+    amp:"7-Seg Alarm Lookup",
+    alarm:"Alarm Guide",
+  };
+
+  const alarmContent = () => {
+    // Interactive tools / reference
+    if (alarm==="status") return <StatusPage />;
+    if (alarm==="dgn")    return <Dgn358Page />;
+    // Authored alarm cards
+    if (alarm==="psfan")  return <PsFanCard />;
+    if (alarm==="sv401")  return <Dgn358Page />;
+    if (alarm==="sv417")  return <SV417Card />;
+    if (alarm==="sv410")  return <ExcessErrorCard />;
+    if (alarm==="ot500")  return <OTCard />;
+    if (alarm==="esp")    return <EspCard />;
+    if (alarm==="sv_encoder") return <EncoderAlarmCard />;
+    // Amplifier LED alarm opened from the search picker: "amp:UNIT:CODE"
+    if (typeof alarm === "string" && alarm.startsWith("amp:")) {
+      const [, unit, ledCode] = alarm.split(":");
+      const dbMap = { PSM: PSM_ALARM_DB, SVM: SVM_ALARM_DB, SPM: SPM_ALARM_DB };
+      const e = (dbMap[unit] || []).find(x => x.code === ledCode);
+      if (e) return <AmpLedCard unit={unit} entry={e} />;
+    }
+    // Spindle status error opened from search/browse: "err:SPM:07"
+    if (typeof alarm === "string" && alarm.startsWith("err:")) {
+      const [, , errCode] = alarm.split(":");
+      const e = SPM_ERROR_DB.find(x => x.code === errCode);
+      if (e) return <AmpLedCard unit="SPM" entry={e} kind="error" />;
+    }
+    // Stub fallback for any catalogued but unauthored alarm
+    const entry = findAlarmByKey(alarm);
+    if (entry && Array.isArray(entry.steps) && entry.steps.length > 0) return <GenericAuthoredCard alarm={entry} onNav={goAlarm} />;
+    if (entry) return <SkeletonAlarmCard alarm={entry} onNav={goAlarm} />;
+    return (
+      <div style={{textAlign:"center",padding:"40px 20px",color:C.textSub}}>
+        <div style={{fontSize:40,marginBottom:12}}>🔍</div>
+        <div style={{fontSize:16,fontWeight:600,color:C.text,marginBottom:8}}>Alarm not in database yet</div>
+        <div style={{fontSize:13,lineHeight:1.6}}>We're adding more alarms regularly. Use the Browse page to see what's available.</div>
+      </div>
+    );
+  };
+
+  const scenarioContent = () => {
+    const entry = findScenarioByKey(scenario);
+    if (entry) return <ScenarioCard scenario={entry} onAlarm={goAlarm} />;
+    return (
+      <div style={{textAlign:"center",padding:"40px 20px",color:C.textSub}}>
+        <div style={{fontSize:40,marginBottom:12}}>🧭</div>
+        <div style={{fontSize:16,fontWeight:600,color:C.text,marginBottom:8}}>Scenario not found</div>
+      </div>
+    );
+  };
+
+  return (
+    <>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700;800&display=swap');
+        * { box-sizing:border-box; margin:0; padding:0; }
+        body { background:${C.bg}; font-family:'Inter',-apple-system,'Segoe UI',Roboto,sans-serif; color:${C.text}; -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; }
+        button { font-family:inherit; }
+        input  { font-family:'JetBrains Mono',monospace; }
+        ::-webkit-scrollbar { width:4px; }
+        ::-webkit-scrollbar-track { background:transparent; }
+        ::-webkit-scrollbar-thumb { background:${C.border}; border-radius:2px; }
+        @keyframes blink { 50%{opacity:0} }
+      `}</style>
+      <div style={{maxWidth:430,margin:"0 auto",height:"100vh",display:"flex",
+        flexDirection:"column",background:C.bg,boxShadow:"0 0 60px #00000088"}}>
+
+        {/* Nav bar */}
+        <div style={{display:"flex",alignItems:"center",gap:10,padding:"14px 16px 12px",
+          borderBottom:`1px solid ${C.border}`,background:C.surface,flexShrink:0}}>
+          {screen!=="home" && (
+            <button onClick={goBack}
+              style={{width:32,height:32,borderRadius:8,background:C.card,
+                border:`1px solid ${C.border}`,color:C.text,fontSize:16,cursor:"pointer",flexShrink:0}}>
+              ‹
+            </button>
+          )}
+          <div style={{flex:1,fontSize:16,fontWeight:700,color:C.text}}>{titles[screen]||"FanuXpert"}</div>
+        </div>
+
+        {/* Content */}
+        <div style={{flex:1,overflowY:"auto",padding:screen==="home"?0:"0 16px 24px"}}>
+          {screen==="home"     && <HomePage onPhoto={()=>nav("photo")} onManual={()=>nav("manual")} onAlarm={goAlarm} history={history} />}
+          {screen==="photo"    && <PhotoPage onResult={goAlarm} />}
+          {screen==="manual"   && <ManualEntryPage onResult={goAlarm} />}
+          {screen==="browse"   && <BrowsePage onAlarm={goAlarm} cat={browseCat} onCat={(c)=>go({screen:"browse",browseCat:c})} onBack={goBack} />}
+          {screen==="history"  && <HistoryPage history={history} onAlarm={goAlarm} />}
+          {screen==="guides"   && <GuidesPage onScenario={goScenario} />}
+          {screen==="amp"      && <AmpAlarmPage onNav={goAlarm} />}
+          {screen==="scenario" && <div style={{paddingTop:20}}>{scenarioContent()}</div>}
+          {screen==="alarm"    && <div style={{paddingTop:20}}>{alarmContent()}</div>}
+        </div>
+
+        {/* Bottom tab bar */}
+        <div style={{display:"flex",borderTop:`1px solid ${C.border}`,background:C.surface,flexShrink:0}}>
+          {[
+            {icon:"🏠",label:"Home",   key:"home"},
+            {icon:"🔍",label:"Search", key:"manual"},
+            {icon:"📚",label:"Alarms", key:"browse"},
+            {icon:"🧭",label:"Guides", key:"guides"},
+          ].map(t=>(
+            <button key={t.key} onClick={()=>nav(t.key)}
+              style={{flex:1,padding:"10px 4px 8px",background:"transparent",border:"none",
+                cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+              <span style={{fontSize:20}}>{t.icon}</span>
+              <span style={{fontSize:10,fontWeight:600,color:screen===t.key?C.fanuc:C.textSub}}>{t.label}</span>
+              {screen===t.key&&<span style={{width:4,height:4,borderRadius:"50%",background:C.fanuc}} />}
+            </button>
+          ))}
+        </div>
+      </div>
+    </>
+  );
+}
