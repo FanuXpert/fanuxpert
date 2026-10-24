@@ -21,6 +21,12 @@ const C = {
   textDim:   "#3D4D5C",
 };
 
+// ── feature flags ────────────────────────────────────────────────
+// Photo mode (read the alarm code from a photo of the screen) is paused
+// before launch. Flip this to true to bring it back — the PhotoPage code
+// and its route are left fully intact, just hidden while this is false.
+const PHOTO_MODE_ENABLED = false;
+
 // ── alarm database ───────────────────────────────────────────────
 // Ordered per B-65285EN §2.4 + PS/OT from B-64115EN
 const ALARM_DB = [
@@ -7216,11 +7222,12 @@ function HomePage({ onPhoto, onManual, onAlarm, favorites }) {
         {/* Heading now scrolls with the content (not frozen). */}
         <div>
           <div style={{fontSize:26,fontWeight:800,color:C.text,letterSpacing:-0.8,lineHeight:1.2,marginBottom:8}}>Alarm on the machine?</div>
-          <div style={{fontSize:14,color:C.textSub,lineHeight:1.6}}>Photograph the screen or enter the alarm code manually.</div>
+          <div style={{fontSize:14,color:C.textSub,lineHeight:1.6}}>{PHOTO_MODE_ENABLED ? "Photograph the screen or enter the alarm code manually." : "Enter the alarm code below for field-ready troubleshooting steps."}</div>
         </div>
         {/* Primary field action — type the alarm code right here, no extra tap. */}
         <AlarmSearch onResult={onAlarm} showHeading={false} />
 
+        {PHOTO_MODE_ENABLED && (
         <button onClick={onPhoto} style={{background:`linear-gradient(135deg,${C.fanucDim},#1a1200)`,
           border:`2px solid ${C.fanuc}`,borderRadius:16,padding:"20px 18px",
           display:"flex",alignItems:"center",gap:14,cursor:"pointer",textAlign:"left",width:"100%"}}>
@@ -7231,6 +7238,7 @@ function HomePage({ onPhoto, onManual, onAlarm, favorites }) {
             <div style={{fontSize:12,color:C.textSub,lineHeight:1.4}}>Can't type the code? Let AI read it from a photo</div>
           </div>
         </button>
+        )}
 
         <div style={{marginTop:4}}>
           <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:10}}>Quick Access</div>
@@ -7239,7 +7247,6 @@ function HomePage({ onPhoto, onManual, onAlarm, favorites }) {
               { icon:"📊", label:"STATUS Display",  sub:"LED state reference",       key:"status" },
               { icon:"🔢", label:"DGN 358 Decoder", sub:"SV0401 diagnostic tool",    key:"dgn" },
               { icon:"🔴", label:"7-Seg Lookup",    sub:"PSM / SVM / SPM codes",     key:"amp" },
-              { icon:"⭐", label:"Favorites",       sub:"Your saved alarms",         key:"favorites" },
             ].map(item=>(
               <button key={item.key} onClick={()=>onAlarm(item.key)}
                 style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,
@@ -7749,7 +7756,7 @@ export default function App() {
         {/* Content */}
         <div style={{flex:1,overflowY:"auto",padding:screen==="home"?0:"0 16px 24px"}}>
           {screen==="home"     && <HomePage onPhoto={()=>nav("photo")} onManual={()=>nav("manual")} onAlarm={goAlarm} favorites={favorites} />}
-          {screen==="photo"    && <PhotoPage onResult={goAlarm} />}
+          {screen==="photo"    && PHOTO_MODE_ENABLED && <PhotoPage onResult={goAlarm} />}
           {screen==="manual"   && <ManualEntryPage onResult={goAlarm} />}
           {screen==="browse"   && <BrowsePage onAlarm={goAlarm} cat={browseCat} onCat={(c)=>go({screen:"browse",browseCat:c})} onBack={goBack} />}
           {screen==="favorites" && <FavoritesPage favorites={favorites} onAlarm={goAlarm} onRemove={removeFavorite} />}
@@ -7762,10 +7769,11 @@ export default function App() {
         {/* Bottom tab bar */}
         <div style={{display:"flex",borderTop:`1px solid ${C.border}`,background:C.surface,flexShrink:0}}>
           {[
-            {icon:"🏠",label:"Home",   key:"home"},
-            {icon:"🔍",label:"Search", key:"manual"},
-            {icon:"📚",label:"Alarms", key:"browse"},
-            {icon:"🧭",label:"Guides", key:"guides"},
+            {icon:"🏠",label:"Home",      key:"home"},
+            {icon:"🔍",label:"Search",    key:"manual"},
+            {icon:"📚",label:"Alarms",    key:"browse"},
+            {icon:"🧭",label:"Guides",    key:"guides"},
+            {icon:"⭐",label:"Favorites", key:"favorites"},
           ].map(t=>(
             <button key={t.key} onClick={()=>nav(t.key)}
               style={{flex:1,padding:"10px 4px 8px",background:"transparent",border:"none",
