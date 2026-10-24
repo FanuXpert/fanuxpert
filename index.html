@@ -7613,16 +7613,45 @@ function App() {
     return e ? { key: alarm, title: e.title, codes: e.codes || [] } : null;
   })();
 
-  // Phone hardware Back button → act like the in-app back arrow.
-  // We keep one "armed" history entry; each hardware Back pops our own nav
-  // stack and immediately re-arms, so Back walks the app instead of leaving it.
-  const goBackRef   = useRef(goBack);   goBackRef.current   = goBack;
-  const canGoBackRef = useRef(false);   canGoBackRef.current = (screen !== "home" || navStack.length > 0);
+  // Phone hardware Back button → walk back through the app one screen at a
+  // time, and only leave the app once you're already at Home.
+  //
+  // How: we mirror the app's own "how many back steps are left" into the
+  // browser's history, pushing a real entry on each FORWARD move (which
+  // happens inside a tap — a genuine user gesture). This matters because
+  // Chrome on Android silently discards history entries created WITHOUT a
+  // user gesture — the reason the old "re-arm inside the Back handler"
+  // trick let the 2nd Back press fall straight out of the app.
+  const bottomScreen = navStack.length > 0 ? navStack[0].screen : screen;
+  const backSteps    = navStack.length + (bottomScreen !== "home" ? 1 : 0);
+
+  const goBackRef    = useRef(goBack);    goBackRef.current    = goBack;
+  const backStepsRef = useRef(backSteps); backStepsRef.current = backSteps;
+  const histDepthRef = useRef(0);    // browser entries we've pushed to mirror app depth
+  const suppressPop  = useRef(false); // ignore the popstate from the history.go() we trigger ourselves
+
+  // Keep the browser's history depth equal to the app's back depth.
   useEffect(() => {
-    window.history.pushState(null, "");            // arm
+    const have = histDepthRef.current;
+    if (backSteps > have) {
+      for (let i = 0; i < backSteps - have; i++) window.history.pushState(null, "");
+      histDepthRef.current = backSteps;
+    } else if (backSteps < have) {
+      suppressPop.current = true;            // the pops below are ours, not the user's
+      histDepthRef.current = backSteps;
+      window.history.go(backSteps - have);   // negative → unwind the extra entries
+    }
+  }, [backSteps]);
+
+  // A real Back press lands here: consume it as exactly one in-app step.
+  useEffect(() => {
     const onPop = () => {
-      if (canGoBackRef.current) goBackRef.current();
-      window.history.pushState(null, "");          // re-arm so Back stays inside the app
+      if (suppressPop.current) { suppressPop.current = false; return; }
+      if (backStepsRef.current > 0) {
+        histDepthRef.current = Math.max(0, histDepthRef.current - 1);
+        goBackRef.current();
+      }
+      // backSteps === 0 (already at Home): let the browser leave the app normally.
     };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
