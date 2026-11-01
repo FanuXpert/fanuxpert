@@ -66,22 +66,22 @@ const ALARM_DB = [
     desc:"Servo ready (VRDY) didn't come on, or dropped during operation — check for a preceding alarm first, then read DGN 358 to see which ready step failed",
     type:"SV", severity:"high",
     summary:"The servo amplifier's ready signal (VRDY) never turned on, or turned off during operation. Very often it's secondary to another servo/amp alarm — clear that first. DGN 358 pinpoints exactly which step of the ready handshake failed; then work the power magnetic circuit around the amplifier.",
-    context:"B-64115EN §8.14: MCON (CNC→amp, 'turn MCC on / activate') and VRDY (amp→CNC, 'I'm ready') are exchanged over the FSSB. 401 fires if VRDY doesn't come on, or drops mid-operation. The manual's first note matters: this alarm is often raised because ANOTHER alarm fired — take action on that first alarm before chasing 401. DGN 358 (V ready-off info) is the fast way in — it shows how far the ready sequence got.",
+    context:"Authoritative reference is B-65285EN §4.2.2 (p18). MCON (CNC→amp, 'activate / MCC on') and VRDY (amp→CNC, 'I'm ready') are exchanged over the FSSB serial link. 401 fires if VRDY doesn't come on, or drops mid-operation. The manual's first note matters: this alarm is often raised because ANOTHER alarm fired — take action on that first alarm before chasing 401. §4.2.2 gives a short check-list (comms cable between amps, ESP, MCON/axis-detach, control PCB); if those don't explain it, DGN 358 (V ready-off info) shows exactly how far the ready sequence got.",
     steps:[
       { title:"Is there another alarm? Clear it first",
         detail:"The manual is explicit: 401 is frequently secondary to another servo/PSM/SPM alarm. Check the full alarm list and the amplifier 7-seg displays. If a PSM ('−' / a code) or SVM/SPM alarm is present, work THAT first — 401 often clears with it." },
       { title:"Read DGN 358 to see which ready step failed",
-        detail:"SYSTEM → DGN → 358 (V ready-off info). Convert to binary; the ready steps set in sequence, and the first bit that is NOT 1 (from bit 5 upward) is where it stalled: bit6 = *ESP, bits7–9 = MCON, bit10 = CRDY (PS ready), bit11 = RLY (DB relay), bit12 = INTL (interlock), bit13 = DRDY (drive ready). Common values: 417 = still in E-stop; 993 = PS CRDY not output; 4065 = interlock not input; 97 = axis-detach set. (Same decode as the VRDY-OFF troubleshooting guide.)" },
-      { title:"Check the power magnetic circuit — the §8.14 list",
-        detail:"Work the manual's checklist: PSM control power on? Emergency stop fully released? Terminating connector fitted on JX1B of the last (terminating) amplifier? MCC actually on — and if there's an external MCC sequence besides the PSM's MCC contact, check that too? Is the MCC-drive power supplied? Is the breaker on?" },
+        detail:"SYSTEM → DGN → 358 (V ready-off info). Convert to binary and read bits 5–14: as the amp comes ready they turn to 1 in order — bit5 HRDY → bit6 *ESP → bits7–9 MCON → bit10 CRDY (PS ready) → bit11 RLY (DB relay energised) → bit12 INTL (interlock) → bit13 DRDY (drive ready) → bit14 SRDY. All 1 = fully ready; the first bit still at 0 is the step that stalled. Easier in the field — just match the whole decimal value against the manual's table: 417 = still in E-stop (*ESP); 993 = PS 'ready' (CRDY) not output; 4065 = interlock not input; 97 = axis-detach function set; 225 / 481 / 2017 / 8161 = replace the servo amplifier. (B-65285EN §4.2.2, p18–19.)" },
+      { title:"Work the §4.2.2 VRDY-OFF check-list",
+        detail:"B-65285EN §4.2.2, in order: (1) is the comms cable between amplifiers (CXA2A/CXA2B) seated correctly? (2) is the emergency-stop signal at CX4 on the Power Supply released and wired correctly? (3) has the axis-detach function blocked the MCON ready command from the CNC to the SVM? (4) is the SVM control PCB (faceplate) pushed fully home — reseat it, and replace it if 401 persists. Then confirm the PSM has control power, the MCC is actually pulling in, and the breaker is on." },
       { title:"Check the PSM/SPM for their own alarms",
         detail:"Read the PSM and SPM 7-seg displays directly. An alarm there (converter or spindle) stops the whole rack reaching ready and surfaces as 401 on the axis. Resolve the amplifier-side alarm." },
       { title:"Replace the servo amplifier",
-        detail:"§8.14: if the power magnetic circuit around the amplifier is all good and no upstream alarm explains it, the servo amplifier is the likely fault — replace the SVM for the alarming axis." },
+        detail:"If the power magnetic circuit around the amplifier is all good and no upstream alarm explains it, the servo amplifier is the likely fault — replace the SVM for the alarming axis. (DGN 358 values 225 / 481 / 2017 / 8161 point straight here.)" },
       { title:"Replace the axis control card",
-        detail:"§8.14 second action: if replacing the amplifier doesn't clear 401, replace the axis control card on the CNC (the FSSB master that exchanges MCON/VRDY). See §2.4 for its location." },
+        detail:"If replacing the amplifier doesn't clear 401, replace the axis control card on the CNC (the FSSB master that exchanges MCON/VRDY). See §2.4 for its location." },
     ],
-    source:"B-64115EN §8.14" },
+    source:"B-65285EN §4.2.2 (p18); B-64115EN §8.14" },
   { key:"sv402", codes:["402","SV0402"], title:"SV Card Not Exist",
     desc:"Axis control card is not installed in the CNC",
     type:"SV", severity:"high",
@@ -5215,7 +5215,6 @@ function BitChecklist({ steps, onComplete }) {
 // ── DGN 358 DECODER PAGE ─────────────────────────────────────────
 function Dgn358Page() {
   const [dec, setDec] = useState("");
-  const [hex, setHex] = useState("");
   const [val, setVal] = useState(null);
   const [doneMap, setDoneMap] = useState({});  // tracks per-bit checklist completion
 
@@ -5362,11 +5361,9 @@ function Dgn358Page() {
     },
   ];
 
-    const decode = (from, raw) => {
-    let v;
-    if (from==="dec") { v=parseInt(raw); if(!isNaN(v)) setHex(v.toString(16).toUpperCase()); }
-    else              { v=parseInt(raw,16); if(!isNaN(v)) setDec(String(v)); }
-    setVal(!isNaN(v)&&raw!==""?Math.max(0,Math.min(65535,v)):null);
+  const decode = (raw) => {
+    const v = parseInt(raw, 10);
+    setVal(!isNaN(v) && raw !== "" ? Math.max(0, Math.min(65535, v)) : null);
   };
 
   // Bits checked in startup order (lowest first) — first 0 bit = root cause
@@ -5376,8 +5373,8 @@ function Dgn358Page() {
   return (
     <div>
       <div style={{marginBottom:20}}>
-        <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:6}}>Alarm 401 / SV0401 Tool</div>
-        <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:-0.5}}>DGN No.358 Decoder</div>
+        <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:6}}>DGN No.358 · V ready-off info</div>
+        <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:-0.5}}>SV0401 Diagnostic Tool</div>
         <div style={{fontSize:13,color:C.textSub,marginTop:4,lineHeight:1.6}}>Use only when alarm 401 / SV0401 is the <em>only</em> alarm shown and all amplifier displays show normal state.</div>
       </div>
       <div style={{background:C.redDim,border:`1px solid ${C.red}44`,borderRadius:10,
@@ -5393,23 +5390,16 @@ function Dgn358Page() {
           <br/>The screen shows a decimal number. Enter it below.
         </div>
       </div>
-      <div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap"}}>
-        <div style={{flex:1,minWidth:140}}>
-          <label style={{display:"block",fontSize:11,color:C.textSub,marginBottom:5}}>Decimal value</label>
-          <input value={dec} placeholder="e.g. 31712"
-            onChange={e=>{setDec(e.target.value);decode("dec",e.target.value)}}
+      <div style={{display:"flex",gap:10,marginBottom:16,alignItems:"flex-end",flexWrap:"wrap"}}>
+        <div style={{flex:1,minWidth:160}}>
+          <label style={{display:"block",fontSize:11,color:C.textSub,marginBottom:5}}>DGN 358 value (decimal)</label>
+          <input value={dec} placeholder="e.g. 31712" inputMode="numeric"
+            onChange={e=>{setDec(e.target.value);decode(e.target.value)}}
             style={{width:"100%",background:C.surface,border:`1.5px solid ${C.border}`,
               borderRadius:8,padding:"10px 12px",fontSize:16,fontFamily:"monospace",color:C.text,outline:"none"}} />
         </div>
-        <div style={{flex:1,minWidth:140}}>
-          <label style={{display:"block",fontSize:11,color:C.textSub,marginBottom:5}}>Hex value</label>
-          <input value={hex} placeholder="e.g. 7BE0"
-            onChange={e=>{setHex(e.target.value.toUpperCase());decode("hex",e.target.value)}}
-            style={{width:"100%",background:C.surface,border:`1.5px solid ${C.border}`,
-              borderRadius:8,padding:"10px 12px",fontSize:16,fontFamily:"monospace",color:C.fanuc,outline:"none"}} />
-        </div>
-        <button onClick={()=>{setDec("31712");setHex("7BE0");decode("dec","31712")}}
-          style={{alignSelf:"flex-end",padding:"10px 14px",background:C.fanucDim,
+        <button onClick={()=>{setDec("31712");decode("31712")}}
+          style={{padding:"10px 14px",background:C.fanucDim,
             border:`1px solid ${C.fanuc}44`,borderRadius:8,color:C.fanuc,fontSize:12,
             fontWeight:600,cursor:"pointer",whiteSpace:"nowrap"}}>
           Try example
@@ -7242,18 +7232,29 @@ function HomePage({ onPhoto, onManual, onAlarm, favorites }) {
 
         <div style={{marginTop:4}}>
           <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:1,color:C.textSub,marginBottom:10}}>Quick Access</div>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
             {[
-              { icon:"📊", label:"STATUS Display",  sub:"LED state reference",       key:"status" },
-              { icon:"🔢", label:"DGN 358 Decoder", sub:"SV0401 diagnostic tool",    key:"dgn" },
-              { icon:"🔴", label:"7-Seg Lookup",    sub:"PSM / SVM / SPM codes",     key:"amp" },
+              { icon:<span style={{fontSize:20}}>📊</span>, col:C.fanuc, chip:C.fanucDim,
+                label:"STATUS Display", sub:"Amplifier LED state reference", key:"status" },
+              { icon:<span style={{fontSize:20}}>🩺</span>, col:C.red, chip:C.redDim,
+                label:"SV0401 Diagnostic Tool", sub:"DGN 358 · V ready-off decoder", key:"dgn" },
+              { icon:<SevenSegChar char="8" dp={false} w={17} lit={C.red} glow={false} />, col:C.red, chip:"#1a0707",
+                label:"7-Segment Lookup", sub:"PSM / SVM / SPM alarm codes", key:"amp" },
             ].map(item=>(
               <button key={item.key} onClick={()=>onAlarm(item.key)}
-                style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,
-                  padding:"12px 12px",cursor:"pointer",textAlign:"left"}}>
-                <div style={{fontSize:22,marginBottom:6}}>{item.icon}</div>
-                <div style={{fontSize:13,fontWeight:600,color:C.text,marginBottom:2}}>{item.label}</div>
-                <div style={{fontSize:11,color:C.textSub}}>{item.sub}</div>
+                style={{display:"flex",alignItems:"center",gap:13,width:"100%",
+                  background:C.card,border:`1px solid ${C.border}`,borderRadius:12,
+                  padding:"12px 14px",cursor:"pointer",textAlign:"left"}}>
+                <div style={{width:42,height:42,borderRadius:10,flexShrink:0,
+                  display:"flex",alignItems:"center",justifyContent:"center",
+                  background:item.chip,border:`1px solid ${item.col}44`}}>
+                  {item.icon}
+                </div>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:14,fontWeight:600,color:C.text,marginBottom:2}}>{item.label}</div>
+                  <div style={{fontSize:11.5,color:C.textSub,lineHeight:1.4}}>{item.sub}</div>
+                </div>
+                <span style={{color:C.textDim,fontSize:18,flexShrink:0}}>›</span>
               </button>
             ))}
           </div>
@@ -7657,7 +7658,7 @@ export default function App() {
 
   const titles = {
     home:"FanuXpert", photo:"Photo Mode", manual:"Manual Entry",
-    status:"STATUS Reference", dgn:"DGN 358 Decoder",
+    status:"STATUS Reference", dgn:"SV0401 Diagnostic Tool",
     browse:"All Alarms", favorites:"Favorites",
     guides:"Troubleshooting", scenario:"Guide",
     amp:"7-Seg Alarm Lookup",
