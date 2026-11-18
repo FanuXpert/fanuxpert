@@ -57,6 +57,29 @@ const ALARM_DB = [
     type: "OT", severity: "med",
   },
 
+  // ── COMMUNICATION / I/O ALARMS (RS-232 reader/puncher) ────────────────────
+  { key:"io_rs232", codes:["85","86","87","085","086","087","PS085","PS086","PS087"],
+    title:"Reader/Puncher Interface Alarm (085-087)",
+    desc:"RS-232 program-transfer fault. 085 = parity/overrun, 086 = DR signal off, 087 = buffer overflow. Hitting BOTH channels at once points at the main-board comm chips, not the cable.",
+    type:"PS", severity:"med",
+    summary:"These three fire during program transfer over the RS-232 reader/puncher port. 085 is a data error (baud/parity/stop-bit or device-type mismatch), 086 means the control stopped seeing the DR (data-set-ready) handshake, 087 is a buffer overflow. The single most useful split in the field: does it fail on one channel or on both? One channel = cable, port, or the PC side. Both channels together = the RS-232 driver/receiver chips on the main board, because both JD36A and JD36B share that same front end.",
+    context:"B-64115EN §8.11 and Appendix A. 085 COMMUNICATION ERROR: overrun, parity or framing error — the number of data bits, the baud rate, or the I/O device-type (param 0102) is wrong; an EIA/ISO PUNCH CODE setting mismatch also throws it. 086 DR SIGNAL OFF: the ready signal (DR) from the I/O device went off — device powered off, cable not connected (or a 3-wire cable with no handshake lines), or a defective PCB. 087 BUFFER OVERFLOW: a read-terminate was specified but input did not stop after 10 characters — I/O unit or PCB defective. All three ride the same RS-232 path, so a fault common to that path (the main-board line driver/receiver chips) takes every channel down together.",
+    steps:[
+      { title:"Read which alarm it is — 085 vs 086 vs 087",
+        detail:"085 = data error (baud/parity/stop bits/device-type, or EIA-ISO code mismatch). 086 = the control lost the DR (data-set-ready) handshake. 087 = buffer overflow (read-terminate ignored). 086 is the handshake/hardware one and the most common." },
+      { title:"One channel or both? — the key split",
+        detail:"Move the same known-good cable + PC to the other port and try again. Fails on ONE channel only → the cable, that port, or the PC side. Fails on BOTH channels the same way → stop chasing the cable; suspect the main-board RS-232 driver/receiver chips, which both JD36A and JD36B pass through." },
+      { title:"Check the external device and cable (single-channel path)",
+        detail:"Confirm the PC / Handy File / tape reader is powered and armed in send or receive BEFORE you start the transfer on the CNC. Reseat and wiggle-test the connector; verify the handshake wires are actually present. A 3-wire cable (TXD/RXD/GND only) never asserts DR and throws 086 every time." },
+      { title:"Verify the communication parameters match",
+        detail:"Param 0020 I/O CHANNEL must point at the port you are plugged into: 0 = JD36A (channel 1), 2 = JD36B (channel 2). Param 0102/0112 device type: 0 = RS-232C with DC1-DC4 control, 4 = RS-232C without DC codes, 3 = Handy File. Param 0103/0113 baud rate and 0101/0111 (stop bits #0 SB2, code #3 ASI) must match the PC on both ends. On the SETTING screen, PUNCH CODE (EIA/ISO) must match the device or you get 085/086." },
+      { title:"Loopback test at the CNC port — board vs cable proof",
+        detail:"Make a loopback plug on the JD36A/B connector (Honda PCR 20-pin): jumper 13→3 (ER→DR), 15→5 (RS→CS), and 11→1 (SD→RD). WARNING: pins 10 and 19 are +24V — never jumper them, you will kill the main board. Fit the plug, confirm param 0020 points at that port, then try to READ a program. If 086 clears (now waits, or shows 085 instead) the board's handshake circuit is healthy → the fault is your cable/PC. If 086 STILL appears with 13→3 forcing DR high, the main-board DR receive circuit is dead." },
+      { title:"Confirmed root cause — main-board RS-232 comm chips",
+        detail:"Field-confirmed repair on an FS18i-A throwing 086 on BOTH channels: the two RS-232 line driver/receiver chips on the motherboard had failed. No cable or PC setting could ever fix it — the loopback stays at 086. When both channels are dead together and the loopback does not clear it, go straight to those chips (or swap/repair the main board)." },
+    ],
+    source:"B-64115EN §8.11 (alarm 85-87), §3.2 (I/O params), Appendix A. Field-confirmed root cause: main-board RS-232 driver/receiver chips (FS18i-A, Nov 2026)." },
+
   // ── ENCODER / DETECTOR ALARMS — COMBINED (SV0361-0369 built-in, SV0380-0387 separate) ──
   { key:"sv_encoder",
     codes:["361","362","363","364","365","366","367","368","369",
